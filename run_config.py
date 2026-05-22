@@ -35,6 +35,7 @@ NOTIFY = False
 TELEGRAM_STATUS = False
 updater = None
 bot = None
+_DEVICE_INFO_PRINTED = False
 if TELEGRAM_STATUS and Updater is not None:
     updater = Updater(BOT_TOKEN)  # , use_context=True
     updater.start_polling()
@@ -196,6 +197,7 @@ def run_single(conf, slice=None):
     print('run test single')
 
     algorithms = create_algorithms_dict(conf['algorithms'])
+    print_available_devices_if_needed(algorithms)
     metrics = create_metric_list(conf['metrics'])
     evaluation = load_evaluation(conf['evaluation'])
 
@@ -247,6 +249,7 @@ def run_opt_single(conf, iteration, globals):
     print('run test opt single')
 
     algorithms = create_algorithms_dict(conf['algorithms'])
+    print_available_devices_if_needed(algorithms)
     for k, a in algorithms.items():
         aclass = type(a)
         if not aclass in globals:
@@ -320,6 +323,7 @@ def run_bayopt_single(conf, algorithms, iteration, globals):
             Optional index for the window slice
     '''
     print('run test opt single')
+    print_available_devices_if_needed(algorithms)
 
     for k, a in algorithms.items():
         aclass = type(a)
@@ -898,6 +902,46 @@ def instantiate_algorithm(class_path, params):
             TorchClass = load_class('algorithms.gru4rec.gru4rec_torch.GRU4RecTorch')
             return TorchClass(**params)
         raise
+
+
+def print_available_devices_if_needed(algorithms):
+    """
+    Print available compute devices once when GPU-capable algorithms are present.
+    """
+    global _DEVICE_INFO_PRINTED
+    if _DEVICE_INFO_PRINTED:
+        return
+
+    gpu_capable = []
+    for key, algorithm in algorithms.items():
+        class_name = type(algorithm).__name__
+        if hasattr(algorithm, 'device') or class_name in ('GRU4RecTorch',):
+            gpu_capable.append((key, algorithm))
+
+    if not gpu_capable:
+        return
+
+    print('Device check: GPU-capable algorithms detected.')
+    for key, algorithm in gpu_capable:
+        selected = getattr(algorithm, 'device', 'n/a')
+        print(' - {} ({}) selected device: {}'.format(key, type(algorithm).__name__, selected))
+
+    try:
+        import torch
+    except Exception as exc:
+        print(' - PyTorch device query unavailable: {}'.format(exc))
+        _DEVICE_INFO_PRINTED = True
+        return
+
+    if torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        print(' - CUDA available: {} device(s)'.format(count))
+        for idx in range(count):
+            print('   * cuda:{}: {}'.format(idx, torch.cuda.get_device_name(idx)))
+    else:
+        print(' - CUDA available: 0 (running on CPU)')
+
+    _DEVICE_INFO_PRINTED = True
 
 
 def ensure_dir(file_path):
