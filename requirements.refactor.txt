@@ -1,3 +1,7 @@
+# Shared dependencies for refactor environment.
+# Install torch separately from one of:
+# - requirements.torch.cpu.txt
+# - requirements.torch.cu121.txt
 numpy==2.4.6
 pandas==3.0.3
 scipy==1.17.1

@@ -91,13 +91,9 @@ echo "[3/5] Installing pinned core dependencies"
 
 echo "[4/5] Installing PyTorch stack (${TORCH_TARGET})"
 if [[ "$TORCH_TARGET" == "cpu" ]]; then
-  "$UV_BIN" pip install --python "$PYTHON_BIN" \
-    torch==2.12.0+cpu torchvision==0.27.0+cpu torchaudio==2.11.0+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
+  "$UV_BIN" pip install --python "$PYTHON_BIN" -r requirements.torch.cpu.txt
 else
-  "$UV_BIN" pip install --python "$PYTHON_BIN" \
-    torch==2.12.0+cu121 torchvision==0.27.0+cu121 torchaudio==2.11.0+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
+  "$UV_BIN" pip install --python "$PYTHON_BIN" -r requirements.torch.cu121.txt
 fi
 
 echo "[5/5] Verifying setup"

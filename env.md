@@ -58,18 +58,16 @@ Choose one of the following.
 CPU:
 
 ```bash
-uv pip install torch torchvision torchaudio \
-	--index-url https://download.pytorch.org/whl/cpu
+uv pip install -r requirements.torch.cpu.txt
 ```
 
 NVIDIA GPU (CUDA 12.1 wheels):
 
 ```bash
-uv pip install torch torchvision torchaudio \
-	--index-url https://download.pytorch.org/whl/cu121
+uv pip install -r requirements.torch.cu121.txt
 ```
 
-If your CUDA stack differs, replace `cu121` with the matching PyTorch wheel index.
+If your CUDA stack differs, replace the index URL in the torch requirements file with the matching PyTorch wheel index.
 
 ## 6. Verify environment
 
@@ -77,6 +75,21 @@ If your CUDA stack differs, replace `cu121` with the matching PyTorch wheel inde
 python -V
 python -c "import torch, numpy, pandas; print('torch', torch.__version__)"
 python -c "import torch; print('cuda', torch.cuda.is_available())"
+python -c "import torch; print('torch.version.cuda', torch.version.cuda)"
+
+If `torch.version.cuda` is `None`, you installed a CPU build of torch in that environment. Reinstall with:
+
+```bash
+uv pip uninstall torch torchvision torchaudio
+uv pip install -r requirements.torch.cu121.txt
+```
+
+Then verify GPU visibility:
+
+```bash
+nvidia-smi
+python -m torch.utils.collect_env
+```
 ```
 
 ## 7. Run existing scripts with uv environment
