@@ -151,6 +151,38 @@ To run session-aware, the following libraries are required:
     <li>Activate the conda environment: <code>conda activate srec37</code></li>
     <li>Download the repository: <code>https://github.com/rn5l/session-rec.git</code></li>
 </ol>
+
+<h3>
+    Using uv (refactor environment, Python 3.11)
+</h3>
+<ol>
+    <li>Install uv: <code>curl -LsSf https://astral.sh/uv/install.sh | sh</code></li>
+    <li>Create and activate a virtual environment from the project root:
+        <code>
+            uv venv --python 3.11 .venv
+            source .venv/bin/activate
+        </code>
+    </li>
+    <li>Install shared dependencies: <code>uv pip install -r requirements.refactor.txt</code></li>
+    <li>Install PyTorch for your target:
+        <ol>
+            <li>CPU: <code>uv pip install -r requirements.torch.cpu.txt</code></li>
+            <li>CUDA 12.1 GPU: <code>uv pip install -r requirements.torch.cu121.txt</code></li>
+        </ol>
+    </li>
+    <li>Verify GPU visibility (optional):
+        <code>
+            uv run python check_gpu.py
+            uv run python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"
+        </code>
+    </li>
+    <li>Quick setup script (CPU by default):
+        <code>
+            ./scripts/setup_uv_env.sh
+            ./scripts/setup_uv_env.sh --torch cu121
+        </code>
+    </li>
+</ol>
 <h2>Example of Experiments</h2>
 The data folder contains a small sample dataset. It's possible to have an overview of how the framework works by using as a configuration file:
     <ul><br>For session-based models:
