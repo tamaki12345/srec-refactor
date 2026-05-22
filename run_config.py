@@ -16,9 +16,14 @@ import evaluation.loader as dl
 from builtins import Exception
 import pickle
 import dill
-from telegram.ext.updater import Updater
-from telegram.ext.commandhandler import CommandHandler
-import telegram
+try:
+    from telegram.ext.updater import Updater
+    from telegram.ext.commandhandler import CommandHandler
+    import telegram
+except Exception:
+    Updater = None
+    CommandHandler = None
+    telegram = None
 import random
 import gc
 
@@ -28,11 +33,18 @@ BOT_TOKEN = 'API_TOKEN'
 
 NOTIFY = False
 TELEGRAM_STATUS = False
-if TELEGRAM_STATUS:
+updater = None
+bot = None
+if TELEGRAM_STATUS and Updater is not None:
     updater = Updater(BOT_TOKEN)  # , use_context=True
     updater.start_polling()
-if NOTIFY:
+elif TELEGRAM_STATUS:
+    print('WARN: TELEGRAM_STATUS=True but python-telegram-bot is not available. Telegram status bot disabled.')
+
+if NOTIFY and telegram is not None:
     bot = telegram.Bot(token=BOT_TOKEN)
+elif NOTIFY:
+    print('WARN: NOTIFY=True but python-telegram-bot is not available. Telegram notifications disabled.')
 
 
 def main(conf, out=None):
@@ -45,7 +57,7 @@ def main(conf, out=None):
             Output folder path for endless run listening for new configurations.
     '''
     print('Checking {}'.format(conf))
-    if TELEGRAM_STATUS:
+    if TELEGRAM_STATUS and updater is not None and CommandHandler is not None:
         updater.dispatcher.add_handler( CommandHandler('status', status) )
 
     file = Path(conf)
@@ -620,7 +632,7 @@ def create_algorithms_dict(list):
 
     algorithms = {}
     for algorithm in list:
-        Class = load_class('algorithms.' + algorithm['class'])
+        class_path = 'algorithms.' + algorithm['class']
 
         default_params = algorithm['params'] if 'params' in algorithm else {}
         random_params = generate_random_params(algorithm)
@@ -664,10 +676,10 @@ def create_algorithms_dict(list):
                     kv = k
                     for v in val:
                         kv += '-' + str(v)
-                    instance = Class(**params)
+                    instance = instantiate_algorithm(class_path, params)
                     algorithms[key + kv] = instance
         else:
-            instance = Class(**params)
+            instance = instantiate_algorithm(class_path, params)
             algorithms[key] = instance
 
     return algorithms
@@ -684,7 +696,7 @@ def create_algorithm_dict(entry, additional_params={}):
     algorithms = {}
     algorithm = entry
 
-    Class = load_class('algorithms.' + algorithm['class'])
+    class_path = 'algorithms.' + algorithm['class']
 
     default_params = algorithm['params'] if 'params' in algorithm else {}
 
@@ -728,10 +740,10 @@ def create_algorithm_dict(entry, additional_params={}):
                 kv = k
                 for v in val:
                     kv += '-' + str(v)
-                instance = Class(**params)
+                instance = instantiate_algorithm(class_path, params)
                 algorithms[key + kv] = instance
     else:
-        instance = Class(**params)
+        instance = instantiate_algorithm(class_path, params)
         algorithms[key] = instance
 
     return algorithms
@@ -870,6 +882,22 @@ def load_class(path):
 
     Class = getattr(importlib.import_module(module_name), class_name)
     return Class
+
+
+def instantiate_algorithm(class_path, params):
+    """
+    Instantiate an algorithm class and provide a compatibility fallback for
+    legacy GRU4Rec when Theano is unavailable.
+    """
+    Class = load_class(class_path)
+    try:
+        return Class(**params)
+    except ImportError as exc:
+        if class_path == 'algorithms.gru4rec.gru4rec.GRU4Rec':
+            print('WARN: Falling back to GRU4RecTorch because legacy GRU4Rec backend is unavailable: {}'.format(exc))
+            TorchClass = load_class('algorithms.gru4rec.gru4rec_torch.GRU4RecTorch')
+            return TorchClass(**params)
+        raise
 
 
 def ensure_dir(file_path):
