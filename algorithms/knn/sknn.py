@@ -2,6 +2,7 @@ from _operator import itemgetter
 from math import sqrt
 import random
 import time
+import heapq
 import numpy as np
 import pandas as pd
 import os
@@ -202,16 +203,17 @@ class ContextKNN:
          
         
         # Create things in the format ..
-        predictions = np.zeros(len(predict_for_item_ids))
-        mask = np.in1d( predict_for_item_ids, list(scores.keys()) )
-        
-        items = predict_for_item_ids[mask]
-        values = [scores[x] for x in items]
-        predictions[mask] = values
+        predictions = np.zeros(len(predict_for_item_ids), dtype=np.float32)
+        for idx, item_id in enumerate(predict_for_item_ids):
+            score = scores.get(item_id)
+            if score is not None:
+                predictions[idx] = score
         series = pd.Series(data=predictions, index=predict_for_item_ids)
         
         if self.normalize:
-            series = series / series.max()
+            max_val = series.max()
+            if max_val > 0:
+                series = series / max_val
         
         return series 
 
@@ -260,12 +262,12 @@ class ContextKNN:
         --------
         out : float value           
         '''
-        sc = time.clock()
+        sc = time.perf_counter()
         intersection = len(first & second)
         union = len(first | second )
         res = intersection / union
         
-        self.sim_time += (time.clock() - sc)
+        self.sim_time += (time.perf_counter() - sc)
         
         return res 
     
@@ -466,13 +468,13 @@ class ContextKNN:
         
         #print 'nb of sessions to test ', len(sessionsToTest), ' metric: ', self.metric
         neighbors = []
-        cnt = 0
+        similarity_fn = getattr(self, self.similarity)
+        items_for_session = self.items_for_session
         for session in sessions:
-            cnt = cnt + 1
             # get items of the session, look up the cache first 
-            session_items_test = self.items_for_session( session )
+            session_items_test = items_for_session(session)
             
-            similarity = getattr(self , self.similarity)(session_items_test, session_items)
+            similarity = similarity_fn(session_items_test, session_items)
             if similarity > 0:
                 neighbors.append((session, similarity))
                 
@@ -498,9 +500,10 @@ class ContextKNN:
         '''
         possible_neighbors = self.possible_neighbor_sessions( session_items, input_item_id, session_id )
         possible_neighbors = self.calc_similarity( session_items, possible_neighbors )
-        
-        possible_neighbors = sorted( possible_neighbors, reverse=True, key=lambda x: x[1] )
-        possible_neighbors = possible_neighbors[:self.k]
+        if len(possible_neighbors) > self.k:
+            possible_neighbors = heapq.nlargest(self.k, possible_neighbors, key=itemgetter(1))
+        else:
+            possible_neighbors = sorted(possible_neighbors, reverse=True, key=itemgetter(1))
         
         return possible_neighbors
     
@@ -519,20 +522,18 @@ class ContextKNN:
         '''
         # now we have the set of relevant items to make predictions
         scores = dict()
+        items_for_session = self.items_for_session
         # iterate over the sessions
-        for session in neighbors:
+        for session_id, similarity in neighbors:
             # get the items in this session
-            items = self.items_for_session( session[0] )
+            items = items_for_session(session_id)
             
             for item in items:
-                old_score = scores.get( item )
-                new_score = session[1]
-                
+                old_score = scores.get(item)
                 if old_score is None:
-                    scores.update({item : new_score})
-                else: 
-                    new_score = old_score + new_score
-                    scores.update({item : new_score})
+                    scores[item] = similarity
+                else:
+                    scores[item] = old_score + similarity
                     
         return scores
     
