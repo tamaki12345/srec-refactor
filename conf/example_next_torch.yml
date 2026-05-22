@@ -1,0 +1,39 @@
+type: single
+key: gru4rec_torch_example
+evaluation: evaluation
+data:
+  name: rsc15-100k-torch
+  folder: data/rsc15/prepared/
+  prefix: yoochoose-clicks-100k
+  opts: {sessions_test: 100}
+
+results:
+  folder: results/next/rsc15-100k-torch/
+
+metrics:
+- class: accuracy.HitRate
+  length: [3,5,10,15,20]
+- class: accuracy.MRR
+  length: [3,5,10,15,20]
+- class: accuracy_multiple.NDCG
+  length: [3,5,10,15,20]
+- class: coverage.Coverage
+  length: [20]
+- class: popularity.Popularity
+  length: [20]
+- class: saver.Saver
+  length: [50]
+- class: time_memory_usage.Time_usage_training
+- class: time_memory_usage.Time_usage_testing
+
+algorithms:
+- class: gru4rec.gru4rec_torch.GRU4RecTorch
+  params:
+    n_epochs: 3
+    batch_size: 256
+    layers: [100]
+    learning_rate: 0.001
+    adapt: adam
+    dropout_p_hidden: 0.1
+    embedding: 100
+  key: gru4rec_torch
