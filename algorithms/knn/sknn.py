@@ -3,6 +3,7 @@ from math import sqrt
 import random
 import time
 import heapq
+from itertools import islice
 import numpy as np
 import pandas as pd
 import os
@@ -203,11 +204,7 @@ class ContextKNN:
          
         
         # Create things in the format ..
-        predictions = np.zeros(len(predict_for_item_ids), dtype=np.float32)
-        for idx, item_id in enumerate(predict_for_item_ids):
-            score = scores.get(item_id)
-            if score is not None:
-                predictions[idx] = score
+        predictions = np.fromiter((scores.get(item_id, 0.0) for item_id in predict_for_item_ids), dtype=np.float32, count=len(predict_for_item_ids))
         series = pd.Series(data=predictions, index=predict_for_item_ids)
         
         if self.normalize:
@@ -390,25 +387,13 @@ class ContextKNN:
         --------
         out : set           
         '''
-        sample = set()
-
-        tuples = list()
+        tuples = []
         for session in sessions:
-            time = self.session_time.get( session )
-            if time is None:
-                print(' EMPTY TIMESTAMP!! ', session)
-            tuples.append((session, time))
-            
-        tuples = sorted(tuples, key=itemgetter(1), reverse=True)
-        #print 'sorted list ', sortedList
-        cnt = 0
-        for element in tuples:
-            cnt = cnt + 1
-            if cnt > number:
-                break
-            sample.add( element[0] )
-        #print 'returning sample of size ', len(sample)
-        return sample
+            ts = self.session_time.get(session)
+            if ts is None:
+                continue
+            tuples.append((session, ts))
+        return {session for session, _ in heapq.nlargest(number, tuples, key=itemgetter(1))}
         
         
     def possible_neighbor_sessions(self, session_items, input_item_id, session_id):
@@ -427,7 +412,10 @@ class ContextKNN:
         out : set           
         '''
         
-        self.relevant_sessions = self.relevant_sessions | self.sessions_for_item( input_item_id );
+        input_sessions = self.sessions_for_item(input_item_id)
+        if input_sessions is None:
+            input_sessions = set()
+        self.relevant_sessions = self.relevant_sessions | input_sessions
                
         if self.sample_size == 0: #use all session as possible neighbors
             
@@ -436,16 +424,14 @@ class ContextKNN:
 
         else: #sample some sessions
                 
-            self.relevant_sessions = self.relevant_sessions | self.sessions_for_item( input_item_id );
-                         
             if len(self.relevant_sessions) > self.sample_size:
                 
                 if self.sampling == 'recent':
                     sample = self.most_recent_sessions( self.relevant_sessions, self.sample_size )
                 elif self.sampling == 'random':
-                    sample = random.sample( self.relevant_sessions, self.sample_size )
+                    sample = random.sample(tuple(self.relevant_sessions), self.sample_size)
                 else:
-                    sample = self.relevant_sessions[:self.sample_size]
+                    sample = set(islice(self.relevant_sessions, self.sample_size))
                     
                 return sample
             else: 
@@ -473,6 +459,8 @@ class ContextKNN:
         for session in sessions:
             # get items of the session, look up the cache first 
             session_items_test = items_for_session(session)
+            if session_items_test is None:
+                continue
             
             similarity = similarity_fn(session_items_test, session_items)
             if similarity > 0:
