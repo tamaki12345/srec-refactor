@@ -1,13 +1,31 @@
 import time
-import theano
-from theano import tensor as T
-from theano import function
-from theano.sandbox.rng_mrg import MRG_RandomStreams
 import numpy as np
 import pandas as pd
 from collections import OrderedDict
-mrng = MRG_RandomStreams()
-from algorithms.gru4rec.gpu_ops import gpu_diag_wide
+
+_THEANO_IMPORT_ERROR = None
+try:
+    import theano
+    from theano import tensor as T
+    from theano import function
+    from theano.sandbox.rng_mrg import MRG_RandomStreams
+except Exception as exc:
+    theano = None
+    T = None
+    function = None
+    MRG_RandomStreams = None
+    _THEANO_IMPORT_ERROR = exc
+
+if MRG_RandomStreams is not None:
+    mrng = MRG_RandomStreams()
+else:
+    mrng = None
+
+if T is not None:
+    from algorithms.gru4rec.gpu_ops import gpu_diag_wide
+else:
+    def gpu_diag_wide(_):
+        raise RuntimeError('gpu_diag_wide is unavailable because Theano could not be imported.')
 
 class GRU4Rec:
     '''
@@ -79,18 +97,19 @@ class GRU4Rec:
         header of the timestamp column in the input file (default: 'Time')
 
     '''
-    def __init__(self, loss='bpr-max', final_act='linear', hidden_act='tanh', layers=[100],
+    def __init__(self, loss='bpr-max', final_act='linear', hidden_act='tanh', layers=None,
                  n_epochs=10, batch_size=32, dropout_p_hidden=0.0, dropout_p_embed=0.0, learning_rate=0.1, momentum=0.0, lmbd=0.0, embedding=0, n_sample=2048, sample_alpha=0.75, smoothing=0.0, constrained_embedding=False,
-                 adapt='adagrad', adapt_params=[], grad_cap=0.0, bpreg=1.0,
+                 adapt='adagrad', adapt_params=None, grad_cap=0.0, bpreg=1.0,
                  sigma=0.0, init_as_normal=False, train_random_order=False, time_sort=True,
                  session_key='SessionId', item_key='ItemId', time_key='Time'):
-        self.layers = layers
+        self._ensure_theano_available()
+        self.layers = [100] if layers is None else layers
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.dropout_p_hidden = dropout_p_hidden
         self.dropout_p_embed = dropout_p_embed
         self.learning_rate = learning_rate
-        self.adapt_params = adapt_params
+        self.adapt_params = [] if adapt_params is None else adapt_params
         self.momentum = momentum
         self.sigma = sigma
         self.init_as_normal = init_as_normal
@@ -114,6 +133,15 @@ class GRU4Rec:
         self.n_sample = n_sample
         self.sample_alpha = sample_alpha
         self.smoothing = smoothing
+
+    @staticmethod
+    def _ensure_theano_available():
+        if _THEANO_IMPORT_ERROR is not None:
+            raise ImportError(
+                'GRU4Rec requires Theano, but it could not be imported. '
+                'Use the legacy Theano environment or migrate to the PyTorch implementation. '
+                'Original import error: {}'.format(_THEANO_IMPORT_ERROR)
+            )
     def set_loss_function(self, loss):
         if loss == 'cross-entropy': self.loss_function = self.cross_entropy
         elif loss == 'bpr': self.loss_function = self.bpr
@@ -143,7 +171,7 @@ class GRU4Rec:
         else: raise NotImplementedError
     def set_params(self, **kvargs):
         maxk_len = np.max([len(x) for x in kvargs.keys()])
-        maxv_len = np.max([len(x) for x in kvargs.values()])
+        maxv_len = np.max([len(str(x)) for x in kvargs.values()])
         for k,v in kvargs.items():
             if not hasattr(self, k):
                 print('Unkown attribute: {}'.format(k))
@@ -532,7 +560,7 @@ class GRU4Rec:
         base_order = np.argsort(data.groupby(self.session_key)[self.time_key].min().values) if self.time_sort else np.arange(len(offset_sessions)-1)
         data_items = data.ItemIdx.values
         for epoch in range(self.n_epochs):
-            sc = time.clock();
+            sc = time.perf_counter();
             st = time.time();
             for i in range(len(self.layers)):
                 self.H[i].set_value(np.zeros((self.batch_size,self.layers[i]), dtype=theano.config.floatX), borrow=True)
@@ -604,7 +632,7 @@ class GRU4Rec:
                 print('Epoch {}: NaN error!'.format(str(epoch)))
                 self.error_during_train = True
                 return
-            print('Epoch{}\tloss: {:.6f}'.format(epoch, avgc), 'time: ', (time.clock() - sc), 'c / ', (time.time() - st), 's')
+            print('Epoch{}\tloss: {:.6f}'.format(epoch, avgc), 'time: ', (time.perf_counter() - sc), 'c / ', (time.time() - st), 's')
 
     def predict_next_batch(self, session_ids, input_item_ids, predict_for_item_ids=None, batch=100):
         '''
