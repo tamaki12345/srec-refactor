@@ -1,0 +1,15 @@
+numpy==2.4.6
+pandas==3.0.3
+scipy==1.17.1
+scikit-learn==1.8.0
+pyyaml==6.0.3
+networkx==3.6.1
+numexpr==2.14.1
+tables==3.11.1
+scikit-optimize==0.10.2
+psutil==7.2.2
+pympler==1.1
+python-dateutil==2.9.0.post0
+pytz==2026.2
+dill==0.4.1
+python-telegram-bot==22.7
