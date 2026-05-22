@@ -67,7 +67,7 @@ def main(conf, out=None):
         print('Loading file')
         send_message('processing config ' + conf)
         stream = open(str(file))
-        c = yaml.load(stream)
+        c = yaml.load(stream, Loader=yaml.SafeLoader)
         stream.close()
 
         try:
@@ -77,15 +77,17 @@ def main(conf, out=None):
 
         except (KeyboardInterrupt, SystemExit):
 
-            send_message('manually aborted config ' + list[0])
-            os.rename(list[0], out + '/' + file.name + str(time.time()) + '.cancled')
+            send_message('manually aborted config ' + str(conf))
+            if out is not None:
+                os.rename(str(conf), out + '/' + file.name + str(time.time()) + '.cancled')
 
             raise
 
         except Exception:
-            print('error for config ', list[0])
-            os.rename(list[0], out + '/' + file.name + str(time.time()) + '.error')
-            send_exception('error for config ' + list[0])
+            print('error for config ', str(conf))
+            if out is not None:
+                os.rename(str(conf), out + '/' + file.name + str(time.time()) + '.error')
+            send_exception('error for config ' + str(conf))
             traceback.print_exc()
 
         exit()
@@ -109,7 +111,7 @@ def main(conf, out=None):
                         send_message('processing config ' + list[0])
 
                         stream = open(str(file))
-                        c = yaml.load(stream)
+                        c = yaml.load(stream, Loader=yaml.SafeLoader)
                         stream.close()
 
                         run_file(c)
@@ -146,7 +148,7 @@ def main(conf, out=None):
                     send_message('processing config ' + conf)
 
                     stream = open(str(Path(conf)))
-                    c = yaml.load(stream)
+                    c = yaml.load(stream, Loader=yaml.SafeLoader)
                     stream.close()
 
                     run_file(c)

@@ -69,15 +69,15 @@ class Time_usage_testing:
         Return a tuple of a description string and the current averaged value
         '''
         self.start_time = time.time()
-        self.start_time_cpu = time.clock();
+        self.start_time_cpu = time.perf_counter();
 
     def stop_predict(self, algorithm):
         '''
         Return a tuple of a description string and the current averaged value
         '''
         self.time_count += 1
-        self.time_sum_cpu = time.clock() - self.start_time_cpu
-        self.time_sum = time.clock() - self.start_time
+        self.time_sum_cpu = time.perf_counter() - self.start_time_cpu
+        self.time_sum = time.perf_counter() - self.start_time
     
     def result(self):
         '''
