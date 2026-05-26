@@ -1,5 +1,26 @@
 # 実装・進捗履歴ログ
 
+## 2026-05-26 (ボトルネック再計測・3回平均)
+
+### 比較実験（RUNS=3, 1分タイムアウト）
+- Torch strict: 1482.67 pair/s
+- Torch optimized: 3443.68 pair/s
+- Theano: 67566.78 pair/s
+- optimized/strict: 2.32倍
+- Theano比: 5.1%
+
+#### 各回のpair/s
+| Run | Torch strict | Torch optimized | Theano |
+|---|---:|---:|---:|
+| 1 | 1481.31 | 3496.64 | 68774.26 |
+| 2 | 1484.92 | 3415.34 | 64403.41 |
+| 3 | 1481.77 | 3419.06 | 69522.68 |
+
+#### プロファイラ出力（抜粋: m4a_torch_optimized_20260526_170226.log）
+- 1stepあたり: 約3400~3500 pair/s
+- CUDA Graphs, torch.compile, tail graph すべて有効化を確認
+- 依然としてforward以外（データ準備・optimizer step等）のオーバーヘッドが支配的
+
 ## 2026-05-26
 
 ### 3. PyTorchの全step固定長化に向けた前処理経路を実装
