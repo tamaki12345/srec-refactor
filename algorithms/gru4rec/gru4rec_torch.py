@@ -133,6 +133,8 @@ class GRU4RecTorch:
 
         self.model = None
         self.optimizer = None
+        self._sampled_mode = False
+        self._sampled_states = {}
         self.itemidmap = None
         self.n_items = 0
         self.predict = None
@@ -196,6 +198,54 @@ class GRU4RecTorch:
         if length > 1:
             sample = sample.reshape((length, self.n_sample))
         return sample
+
+    def _init_sampled_state(self, param, use_momentum):
+        state = {'acc': torch.zeros_like(param)}
+        if use_momentum:
+            state['velocity'] = torch.zeros_like(param)
+        return state
+
+    def _rowwise_adagrad_step(self, param, row_idx):
+        if row_idx.numel() == 0:
+            return
+        grad = param.grad
+        if grad is None:
+            return
+        state = self._sampled_states[param]
+        eps = 1e-6
+        unique_idx = torch.unique(row_idx)
+
+        with torch.no_grad():
+            if param.ndim == 1:
+                g = grad.index_select(0, unique_idx)
+                acc = state['acc'].index_select(0, unique_idx) + g * g
+                state['acc'].index_copy_(0, unique_idx, acc)
+                scaled = g / torch.sqrt(acc + eps)
+                if self.lmbd > 0:
+                    scaled = scaled + self.lmbd * param.index_select(0, unique_idx)
+                if 'velocity' in state:
+                    vel = state['velocity'].index_select(0, unique_idx)
+                    vel = self.momentum * vel - self.learning_rate * scaled
+                    state['velocity'].index_copy_(0, unique_idx, vel)
+                    param.index_add_(0, unique_idx, vel)
+                else:
+                    updates = -self.learning_rate * scaled
+                    param.index_add_(0, unique_idx, updates)
+            else:
+                g = grad.index_select(0, unique_idx)
+                acc = state['acc'].index_select(0, unique_idx) + g * g
+                state['acc'].index_copy_(0, unique_idx, acc)
+                scaled = g / torch.sqrt(acc + eps)
+                if self.lmbd > 0:
+                    scaled = scaled + self.lmbd * param.index_select(0, unique_idx)
+                if 'velocity' in state:
+                    vel = state['velocity'].index_select(0, unique_idx)
+                    vel = self.momentum * vel - self.learning_rate * scaled
+                    state['velocity'].index_copy_(0, unique_idx, vel)
+                    param.index_add_(0, unique_idx, vel)
+                else:
+                    updates = -self.learning_rate * scaled
+                    param.index_add_(0, unique_idx, updates)
 
     def _softmax_neg(self, scores, m):
         hm = torch.ones_like(scores)
@@ -284,23 +334,35 @@ class GRU4RecTorch:
             constrained_embedding=self.constrained_embedding,
         ).to(self.device)
 
-        if self.adapt.lower() in ('adam', 'adagrad', 'rmsprop', 'adadelta'):
-            if self.adapt.lower() == 'adagrad':
-                # Disable foreach to avoid large temporary tensors on big item spaces.
-                self.optimizer = torch.optim.Adagrad(
-                    self.model.parameters(),
-                    lr=self.learning_rate,
-                    weight_decay=self.lmbd,
-                    foreach=False,
-                )
-            elif self.adapt.lower() == 'rmsprop':
-                self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
-            elif self.adapt.lower() == 'adadelta':
-                self.optimizer = torch.optim.Adadelta(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+        self._sampled_mode = (self.adapt.lower() == 'adagrad')
+        self._sampled_states = {}
+
+        if self._sampled_mode:
+            dense_params = list(self.model.gru_cell.parameters())
+            if self.constrained_embedding:
+                sampled_params = [self.model.embedding.weight, self.model.output_bias]
             else:
-                self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+                sampled_params = [self.model.embedding.weight, self.model.output.weight, self.model.output.bias]
+            for param in sampled_params:
+                self._sampled_states[param] = self._init_sampled_state(param, use_momentum=(self.momentum > 0))
+            self.optimizer = torch.optim.Adagrad(
+                dense_params,
+                lr=self.learning_rate,
+                weight_decay=self.lmbd,
+                foreach=False,
+            )
         else:
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
+            if self.adapt.lower() in ('adam', 'adagrad', 'rmsprop', 'adadelta'):
+                if self.adapt.lower() == 'rmsprop':
+                    self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
+                elif self.adapt.lower() == 'adadelta':
+                    self.optimizer = torch.optim.Adadelta(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+                elif self.adapt.lower() == 'adagrad':
+                    self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd, foreach=False)
+                else:
+                    self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+            else:
+                self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
 
         n_sessions = len(offset_sessions) - 1
         if n_sessions == 0:
@@ -359,20 +421,39 @@ class GRU4RecTorch:
                     xb = torch.as_tensor(in_idx, dtype=torch.long, device=self.device)
                     yb = torch.as_tensor(y, dtype=torch.long, device=self.device)
 
+                    self.model.zero_grad(set_to_none=True)
                     self.optimizer.zero_grad(set_to_none=True)
                     h_active = hidden[:len(iters)]
                     new_hidden, _ = self.model.forward_step(xb, h_active, self.dropout_p_embed)
-                    if reset.any():
-                        new_hidden = new_hidden.clone()
-                        new_hidden[torch.as_tensor(reset, dtype=torch.bool, device=self.device)] = 0.0
-                    hidden[:len(iters)] = new_hidden.detach()
                     scores = self.model.score_items(new_hidden, yb)
                     yhat = self._apply_final_activation(scores)
                     loss = (len(iters) / float(self.batch_size)) * self._loss_fn(yhat, len(iters))
                     loss.backward()
                     if self.grad_cap > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_cap)
+
+                    if self._sampled_mode:
+                        if self.constrained_embedding:
+                            emb_rows = torch.cat([xb, yb], dim=0)
+                            self._rowwise_adagrad_step(self.model.embedding.weight, emb_rows)
+                            self._rowwise_adagrad_step(self.model.output_bias, yb)
+                            self.model.embedding.weight.grad = None
+                            self.model.output_bias.grad = None
+                        else:
+                            self._rowwise_adagrad_step(self.model.embedding.weight, xb)
+                            self._rowwise_adagrad_step(self.model.output.weight, yb)
+                            self._rowwise_adagrad_step(self.model.output.bias, yb)
+                            self.model.embedding.weight.grad = None
+                            self.model.output.weight.grad = None
+                            self.model.output.bias.grad = None
+
                     self.optimizer.step()
+
+                    next_hidden = new_hidden.detach()
+                    if reset.any():
+                        next_hidden = next_hidden.clone()
+                        next_hidden[torch.as_tensor(reset, dtype=torch.bool, device=self.device)] = 0.0
+                    hidden[:len(iters)] = next_hidden
 
                     bs = len(iters)
                     total_loss += float(loss.detach().cpu().item()) * bs
