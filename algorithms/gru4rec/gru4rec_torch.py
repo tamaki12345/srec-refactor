@@ -33,6 +33,16 @@ class _GRU4RecTorchModel(nn.Module):
             return F.linear(self.dropout(hidden), self.embedding.weight, self.output_bias)
         return self.output(self.dropout(hidden))
 
+    def score_items(self, hidden, item_indices):
+        hidden = self.dropout(hidden)
+        if self.constrained_embedding:
+            weight = self.embedding.weight[item_indices]
+            bias = self.output_bias[item_indices]
+            return F.linear(hidden, weight, bias)
+        weight = self.output.weight[item_indices]
+        bias = self.output.bias[item_indices]
+        return F.linear(hidden, weight, bias)
+
     def forward_step(self, item_indices, hidden):
         emb = self.embedding(item_indices)
         hidden = self.gru_cell(emb, hidden)
@@ -121,7 +131,6 @@ class GRU4RecTorch:
 
         self.model = None
         self.optimizer = None
-        self.criterion = None
         self.itemidmap = None
         self.n_items = 0
         self.predict = None
@@ -177,6 +186,70 @@ class GRU4RecTorch:
         data_items = data['ItemIdx'].to_numpy(dtype=np.int64)
         return data_items, offset_sessions, base_order
 
+    def _softmax_neg(self, scores, m):
+        hm = torch.ones_like(scores)
+        hm[:, :m] = hm[:, :m] - torch.eye(m, device=scores.device, dtype=scores.dtype)
+        x = scores * hm
+        x = x - x.max(dim=1, keepdim=True).values
+        e_x = torch.exp(x) * hm
+        return e_x / e_x.sum(dim=1, keepdim=True).clamp_min(1e-24)
+
+    def _apply_final_activation(self, scores):
+        final_act = self.final_act.lower()
+        if final_act == 'linear':
+            return scores
+        if final_act == 'relu':
+            return torch.relu(scores)
+        if final_act == 'tanh':
+            return torch.tanh(scores)
+        if final_act == 'softmax':
+            return torch.softmax(scores, dim=1)
+        if final_act == 'softmax_logit':
+            return torch.logsumexp(scores, dim=1, keepdim=True) - scores
+        raise NotImplementedError('Unsupported final_act for GRU4RecTorch: {}'.format(self.final_act))
+
+    def _loss_fn(self, yhat, m):
+        eps = 1e-24
+        loss_name = self.loss.lower()
+        diag = torch.diagonal(yhat[:, :m], 0)
+
+        if loss_name == 'cross-entropy':
+            if self.smoothing:
+                n_out = m + self.n_sample
+                term_main = (1.0 - (n_out / (n_out - 1.0)) * self.smoothing) * (-torch.log(diag + eps))
+                term_smooth = (self.smoothing / (n_out - 1.0)) * torch.sum(-torch.log(yhat + eps), dim=1)
+                return torch.mean(term_main + term_smooth)
+            return torch.mean(-torch.log(diag + eps))
+
+        if loss_name == 'xe_logit':
+            if self.smoothing:
+                n_out = m + self.n_sample
+                term_main = (1.0 - (n_out / (n_out - 1.0)) * self.smoothing) * diag
+                term_smooth = (self.smoothing / (n_out - 1.0)) * torch.sum(yhat, dim=1)
+                return torch.mean(term_main + term_smooth)
+            return torch.mean(diag)
+
+        if loss_name == 'bpr':
+            return torch.mean(-torch.log(torch.sigmoid(diag.unsqueeze(1) - yhat) + eps))
+
+        if loss_name == 'bpr-max':
+            softmax_scores = self._softmax_neg(yhat, m)
+            bpr_terms = torch.sigmoid(diag.unsqueeze(1) - yhat) * softmax_scores
+            reg_terms = self.bpreg * torch.sum((yhat ** 2) * softmax_scores, dim=1)
+            return torch.mean(-torch.log(torch.sum(bpr_terms, dim=1) + eps) + reg_terms)
+
+        if loss_name == 'top1':
+            term = torch.mean(torch.sigmoid(-diag.unsqueeze(1) + yhat) + torch.sigmoid(yhat ** 2), dim=1)
+            reg = torch.sigmoid(diag ** 2) / (m + self.n_sample)
+            return torch.mean(term - reg)
+
+        if loss_name == 'top1-max':
+            softmax_scores = self._softmax_neg(yhat, m)
+            y = softmax_scores * (torch.sigmoid(-diag.unsqueeze(1) + yhat) + torch.sigmoid(yhat ** 2))
+            return torch.mean(torch.sum(y, dim=1))
+
+        raise NotImplementedError('Unsupported loss for GRU4RecTorch: {}'.format(self.loss))
+
     def fit(self, data, test=None, sample_store=10000000):
         if len(data) == 0:
             raise ValueError('Training data is empty.')
@@ -200,7 +273,6 @@ class GRU4RecTorch:
             constrained_embedding=self.constrained_embedding,
         ).to(self.device)
 
-        self.criterion = nn.CrossEntropyLoss()
         if self.adapt.lower() in ('adam', 'adagrad', 'rmsprop', 'adadelta'):
             if self.adapt.lower() == 'adagrad':
                 # Disable foreach to avoid large temporary tensors on big item spaces.
@@ -249,12 +321,14 @@ class GRU4RecTorch:
 
                     self.optimizer.zero_grad(set_to_none=True)
                     h_active = hidden[:len(iters)]
-                    new_hidden, logits = self.model.forward_step(xb, h_active)
+                    new_hidden, _ = self.model.forward_step(xb, h_active)
                     if reset.any():
                         new_hidden = new_hidden.clone()
                         new_hidden[torch.as_tensor(reset, dtype=torch.bool, device=self.device)] = 0.0
                     hidden[:len(iters)] = new_hidden.detach()
-                    loss = self.criterion(logits, yb)
+                    scores = self.model.score_items(new_hidden, yb)
+                    yhat = self._apply_final_activation(scores)
+                    loss = (len(iters) / float(self.batch_size)) * self._loss_fn(yhat, len(iters))
                     loss.backward()
                     if self.grad_cap > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_cap)
@@ -357,7 +431,6 @@ class GRU4RecTorch:
     def clear(self):
         self.model = None
         self.optimizer = None
-        self.criterion = None
         self.predict = None
         self.current_session = None
         self._pred_hidden = None
