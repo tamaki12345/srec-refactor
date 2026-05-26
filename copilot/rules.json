@@ -1,0 +1,35 @@
+{
+  "version": "2026-05-26",
+  "project": "srec-refactor",
+  "purpose": "Copilot運用ルールの構造化定義",
+  "rules": {
+    "experiment": {
+      "quickRun": true,
+      "timeoutSec": 60,
+      "targets": [
+        "torch_strict",
+        "torch_optimized",
+        "theano"
+      ]
+    },
+    "logging": {
+      "splitPerRun": true,
+      "historyDir": "copilot",
+      "implementationLog": "copilot/implementation_log.md"
+    },
+    "commit": {
+      "smallScopedCommits": true,
+      "messageLanguage": "ja"
+    },
+    "priority": [
+      "reproducibility",
+      "time_budget",
+      "documentation",
+      "performance"
+    ],
+    "migration": {
+      "pytorchOptimizationStatus": "near_limit",
+      "nextCandidate": "jax_poc"
+    }
+  }
+}
