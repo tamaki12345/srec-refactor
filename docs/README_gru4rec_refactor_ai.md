@@ -117,3 +117,19 @@
 4. CUDA Graphs適用範囲をtail含めて拡張
 5. ボトルネック再計測（pair/s + profiler）
 6. JAX PoCブランチを切って最小再実装
+
+### 実験運用ルール（タイムアウト厳守）
+- 比較実験は長時間化を避けるため、**各実験を約1分でタイムアウト**させる
+- 既定値として `QUICK_RUN=1`, `QUICK_TIMEOUT_SEC=60` を利用する
+
+#### 推奨コマンド
+- 1回だけ比較（strict / optimized / theano）:
+	- `RUNS=1 QUICK_RUN=1 QUICK_TIMEOUT_SEC=60 USE_GPU=0 bash scripts/run_m4a_compare_batch.sh`
+- 3回平均を短時間で確認:
+	- `RUNS=3 QUICK_RUN=1 QUICK_TIMEOUT_SEC=60 USE_GPU=0 bash scripts/run_m4a_compare_batch.sh`
+
+#### 直近のquick run（60秒タイムアウト）
+- Torch strict: `1494.32 pair/s`
+- Torch optimized: `3475.40 pair/s`
+- Theano: `65288.95 pair/s`
+- optimized / strict: `2.3257`
