@@ -1,0 +1,44 @@
+type: single
+key: gru4rec_torch_optimized
+evaluation: evaluation_next_multiple
+data:
+  name: torch
+  folder: data/m4a/
+  prefix: experiment
+  opts: {sessions_test: 1000}
+
+results:
+  folder: results/m4a/
+
+metrics:
+- class: accuracy.HitRate
+  length: [20]
+- class: accuracy.MRR
+  length: [20]
+- class: accuracy_multiple.Precision
+  length: [20]
+- class: accuracy_multiple.Recall
+  length: [20]
+- class: accuracy_multiple.MAP
+  length: [20]
+- class: saver.Saver
+  length: [20]
+
+algorithms:
+- class: gru4rec.gru4rec_torch.GRU4RecTorch
+  params:
+    loss: top1-max
+    final_act: linear
+    dropout_p_hidden: 0.0
+    learning_rate: 0.02
+    adapt: adagrad
+    momentum: 0.1
+    constrained_embedding: true
+    batch_size: 64
+    show_progress: true
+    progress_update_interval: 2048
+    profile_epoch: true
+    use_torch_compile: true
+    compile_backend: aot_eager
+    compile_mode: reduce-overhead
+  key: gru4rec_torch_optimized

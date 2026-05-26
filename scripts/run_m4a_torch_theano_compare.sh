@@ -31,9 +31,16 @@ echo "[INFO] Running Theano experiment in conda env 'srec' (experiment/m4a_thean
   set +u
   source "$(conda info --base)/etc/profile.d/conda.sh"
   conda activate srec
+  if [ "${USE_GPU:-0}" = "1" ]; then
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+    export THEANO_FLAGS="device=cuda0,floatX=float32,dnn.base_path=$CONDA_PREFIX,dnn.include_path=$CONDA_PREFIX/include,dnn.library_path=$CONDA_PREFIX/lib"
+    echo "[INFO] USE_GPU=1: running Theano with GPU (cuda0)"
+  else
+    export THEANO_FLAGS="device=cpu,floatX=float32"
+    echo "[INFO] USE_GPU is not 1: running Theano with CPU"
+  fi
   set -u
-  # Force CPU backend for Theano to avoid GPU/cuDNN runtime dependency in this comparison run.
-  /usr/bin/time -p env THEANO_FLAGS=device=cpu python run_config.py experiment/m4a_theano.yml
+  /usr/bin/time -p python run_config.py experiment/m4a_theano.yml
 ) 2>&1 | tee "$THEANO_LOG"
 
 if grep -q "Falling back to GRU4RecTorch" "$THEANO_LOG"; then
