@@ -345,6 +345,7 @@ class GRU4RecTorch:
         self._compiled_step = None
         self._compile_enabled = False
         self._cuda_graph_full_step = None
+        self._cuda_graph_tail_forward_step = None
 
     @staticmethod
     def _ensure_torch_available():
@@ -586,6 +587,33 @@ class GRU4RecTorch:
             print('CUDA Graph setup failed ({}). Falling back to non-graphed execution.'.format(exc))
             self._cuda_graph_full_step = None
 
+    def _build_cuda_graphed_tail_forward_step(self, full_m):
+        self._cuda_graph_tail_forward_step = None
+        if not self.use_cuda_graphs:
+            return
+        if not self.fixed_candidate_size:
+            return
+        if not str(self.device).startswith('cuda'):
+            return
+        if not torch.cuda.is_available():
+            return
+        graph_fn = getattr(torch.cuda, 'make_graphed_callables', None)
+        if graph_fn is None:
+            return
+
+        def _tail_forward(h_active, xb):
+            new_hidden, _ = self.model.forward_step(xb, h_active, self.dropout_p_embed)
+            return new_hidden
+
+        static_h = torch.zeros((full_m, self.layers[0]), dtype=torch.float32, device=self.device, requires_grad=True)
+        static_x = torch.zeros(full_m, dtype=torch.long, device=self.device)
+        try:
+            self._cuda_graph_tail_forward_step = graph_fn(_tail_forward, (static_h, static_x))
+            print('Enabled CUDA Graphs for tail forward steps (fixed m={}).'.format(full_m))
+        except Exception as exc:
+            print('CUDA Graph tail setup failed ({}). Continuing without tail graph.'.format(exc))
+            self._cuda_graph_tail_forward_step = None
+
     def fit(self, data, test=None, sample_store=10000000):
         """
         Trains the network.
@@ -707,6 +735,7 @@ class GRU4RecTorch:
         xb_host_np = xb_host.numpy()
         yb_host_np = yb_host.numpy()
         self._build_cuda_graphed_full_step(active_batch, full_y_len, active_batch / float(self.batch_size))
+        self._build_cuda_graphed_tail_forward_step(active_batch)
 
         pop = None
         sample_pointer = 0
@@ -829,6 +858,13 @@ class GRU4RecTorch:
                         curr_m == active_batch and
                         y_len == full_y_len
                     )
+                    use_tail_graphed_forward = (
+                        self._cuda_graph_tail_forward_step is not None and
+                        curr_m < active_batch and
+                        self.fixed_candidate_size and
+                        x_len == active_batch and
+                        y_len == full_y_len
+                    )
                     if use_graphed:
                         try:
                             h_graph = h_step.detach().requires_grad_(True)
@@ -836,6 +872,17 @@ class GRU4RecTorch:
                         except Exception as exc:
                             print('CUDA Graph runtime failure ({}). Disabling CUDA Graphs.'.format(exc))
                             self._cuda_graph_full_step = None
+                            new_hidden, loss = self._compiled_step(h_step, xb, yb, curr_m, step_scale)
+                    elif use_tail_graphed_forward:
+                        try:
+                            h_graph = h_step.detach().requires_grad_(True)
+                            new_hidden = self._cuda_graph_tail_forward_step(h_graph, xb)
+                            scores = self.model.score_items(new_hidden[:curr_m], yb)
+                            yhat = self._apply_final_activation(scores)
+                            loss = step_scale * self._loss_fn(yhat, curr_m)
+                        except Exception as exc:
+                            print('CUDA Graph tail runtime failure ({}). Disabling tail graph.'.format(exc))
+                            self._cuda_graph_tail_forward_step = None
                             new_hidden, loss = self._compiled_step(h_step, xb, yb, curr_m, step_scale)
                     else:
                         try:
