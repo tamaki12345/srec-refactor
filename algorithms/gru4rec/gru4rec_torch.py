@@ -572,9 +572,9 @@ class GRU4RecTorch:
             return
 
         def _full_step(h_active, xb, yb):
-            return self._compiled_step(h_active, xb, yb, full_m, full_scale)
+            return self._step_forward_loss(h_active, xb, yb, full_m, full_scale)
 
-        static_h = torch.zeros((full_m, self.layers[0]), dtype=torch.float32, device=self.device)
+        static_h = torch.zeros((full_m, self.layers[0]), dtype=torch.float32, device=self.device, requires_grad=True)
         static_x = torch.zeros(full_m, dtype=torch.long, device=self.device)
         static_y = torch.zeros(full_y_len, dtype=torch.long, device=self.device)
         try:
@@ -808,7 +808,8 @@ class GRU4RecTorch:
                     )
                     if use_graphed:
                         try:
-                            new_hidden, loss = self._cuda_graph_full_step(h_active, xb, yb)
+                            h_graph = h_active.detach().requires_grad_(True)
+                            new_hidden, loss = self._cuda_graph_full_step(h_graph, xb, yb)
                         except Exception as exc:
                             print('CUDA Graph runtime failure ({}). Disabling CUDA Graphs.'.format(exc))
                             self._cuda_graph_full_step = None
