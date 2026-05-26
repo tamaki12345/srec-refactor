@@ -1,5 +1,11 @@
 import numpy as np
 import pandas as pd
+import importlib
+
+try:
+    tqdm = importlib.import_module('tqdm.auto').tqdm
+except Exception:
+    tqdm = None
 
 try:
     import torch
@@ -138,7 +144,7 @@ class GRU4RecTorch:
                  adapt='adagrad', adapt_params=[], grad_cap=0.0, bpreg=1.0,
                  sigma=0.0, init_as_normal=False, train_random_order=False, time_sort=True,
                  session_key='SessionId', item_key='ItemId', time_key='Time',
-                 device='auto', seed=42)
+                 device='auto', seed=42, show_progress=True)
     Initializes the network.
 
     Parameters
@@ -208,6 +214,8 @@ class GRU4RecTorch:
         training/inference device (default: 'auto').
     seed : int
         random seed for NumPy and PyTorch (default: 42).
+    show_progress : bool
+        if True, display per-epoch tqdm progress with leave=False (default: True).
     """
 
     def __init__(
@@ -241,6 +249,7 @@ class GRU4RecTorch:
         time_key='Time',
         device='auto',
         seed=42,
+        show_progress=True,
     ):
         self._ensure_torch_available()
 
@@ -272,6 +281,7 @@ class GRU4RecTorch:
         self.item_key = item_key
         self.time_key = time_key
         self.seed = int(seed)
+        self.show_progress = bool(show_progress)
 
         if len(self.layers) != 1:
             raise NotImplementedError('GRU4RecTorch currently supports exactly one GRU layer.')
@@ -581,6 +591,7 @@ class GRU4RecTorch:
         n_sessions = len(offset_sessions) - 1
         if n_sessions == 0:
             raise ValueError('No sessions were found in training data.')
+        total_pairs = int(len(data_items) - n_sessions)
         active_batch = min(self.batch_size, n_sessions)
 
         pop = None
@@ -605,6 +616,9 @@ class GRU4RecTorch:
 
         for epoch in range(self.n_epochs):
             self.model.train()
+            pbar = None
+            if self.show_progress and tqdm is not None and total_pairs > 0:
+                pbar = tqdm(total=total_pairs, desc='Epoch{}'.format(epoch), leave=False, unit='pair')
             session_idx_arr = np.random.permutation(n_sessions) if self.train_random_order else base_order
             iters = np.arange(active_batch, dtype=np.int64)
             maxiter = iters.max() if len(iters) else -1
@@ -649,6 +663,8 @@ class GRU4RecTorch:
                     if torch.isnan(loss).item():
                         print(str(epoch) + ': NaN error!')
                         self.error_during_train = True
+                        if pbar is not None:
+                            pbar.close()
                         return
                     loss.backward()
                     if self.grad_cap > 0:
@@ -680,6 +696,8 @@ class GRU4RecTorch:
                     bs = len(iters)
                     total_loss += float(loss.detach().cpu().item()) * bs
                     total_count += bs
+                    if pbar is not None:
+                        pbar.update(bs)
 
                 start = start + minlen - 1
                 finished_mask = (end - start <= 1)
@@ -703,6 +721,11 @@ class GRU4RecTorch:
                 end = end[valid_mask]
                 if n_valid < len(valid_mask):
                     hidden = hidden[torch.as_tensor(valid_mask, dtype=torch.bool, device=self.device)]
+
+            if pbar is not None:
+                if total_count < total_pairs:
+                    pbar.update(total_pairs - total_count)
+                pbar.close()
 
             print('Epoch{}\tloss: {:.6f}'.format(epoch, total_loss / max(total_count, 1)))
 
