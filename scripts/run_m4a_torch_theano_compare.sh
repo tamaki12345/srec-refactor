@@ -12,8 +12,8 @@ THEANO_LOG="$LOG_DIR/m4a_theano_${TS}.log"
 SUMMARY_MD="$LOG_DIR/summary_${TS}.md"
 
 run_with_optional_timeout() {
-  if [ "${QUICK_RUN:-0}" = "1" ]; then
-    timeout "${QUICK_TIMEOUT_SEC:-65}" "$@" || {
+  if [ "${QUICK_RUN:-1}" = "1" ]; then
+    timeout "${QUICK_TIMEOUT_SEC:-60}" "$@" || {
       rc="$?"
       if [ "$rc" -eq 124 ]; then
         echo "[WARN] QUICK_RUN timeout reached for command: $*"

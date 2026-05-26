@@ -35,7 +35,7 @@ extract_pair_s_from_summary() {
   local summary_file="$1"
   local label="$2"
   awk -F'|' -v key="$label" '
-    $0 ~ key {
+    /^\|/ && $2 ~ key {
       gsub(/^[ \t]+|[ \t]+$/, "", $3)
       print $3
       exit
@@ -83,7 +83,7 @@ for i in $(seq 1 "$RUNS"); do
   echo "[INFO] Run $i/$RUNS"
 
   BEFORE_COUNT="$(find "$OUT_DIR" -maxdepth 1 -type f -name 'summary_*.md' | wc -l)"
-  QUICK_RUN="${QUICK_RUN:-0}" QUICK_TIMEOUT_SEC="${QUICK_TIMEOUT_SEC:-65}" USE_GPU="${USE_GPU:-0}" \
+  QUICK_RUN="${QUICK_RUN:-1}" QUICK_TIMEOUT_SEC="${QUICK_TIMEOUT_SEC:-60}" USE_GPU="${USE_GPU:-0}" \
     bash "$COMPARE_SCRIPT"
   AFTER_COUNT="$(find "$OUT_DIR" -maxdepth 1 -type f -name 'summary_*.md' | wc -l)"
 
@@ -126,7 +126,8 @@ RATIO_OPT_TO_THEANO="$(ratio_or_na "$OPT_MEAN" "$THEANO_MEAN")"
   echo "# M4A Compare Batch Summary ($TS)"
   echo
   echo "- RUNS: $RUNS"
-  echo "- QUICK_RUN: ${QUICK_RUN:-0}"
+  echo "- QUICK_RUN: ${QUICK_RUN:-1}"
+  echo "- QUICK_TIMEOUT_SEC: ${QUICK_TIMEOUT_SEC:-60}"
   echo "- USE_GPU: ${USE_GPU:-0}"
   echo
   echo "## Per-run pair/s"
