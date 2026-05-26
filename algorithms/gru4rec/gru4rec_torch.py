@@ -54,10 +54,86 @@ class _GRU4RecTorchModel(nn.Module):
 
 class GRU4RecTorch:
     """
-    Minimal PyTorch GRU4Rec implementation for staged migration from Theano.
+    Code based on work by Hidasi et al., Recurrent Neural Networks with Top-k
+    Gains for Session-based Recommendations, CoRR abs/1706.03847, 2017.
 
-    The public API mirrors legacy GRU4Rec so existing evaluation code can be
-    reused while model internals are modernized incrementally.
+    GRU4RecTorch(loss='bpr-max', final_act='linear', hidden_act='tanh', layers=[100],
+                 n_epochs=10, batch_size=32, dropout_p_hidden=0.0, dropout_p_embed=0.0,
+                 learning_rate=0.1, momentum=0.0, lmbd=0.0, embedding=0, n_sample=2048,
+                 sample_alpha=0.75, smoothing=0.0, constrained_embedding=False,
+                 adapt='adagrad', adapt_params=[], grad_cap=0.0, bpreg=1.0,
+                 sigma=0.0, init_as_normal=False, train_random_order=False, time_sort=True,
+                 session_key='SessionId', item_key='ItemId', time_key='Time',
+                 device='auto', seed=42)
+    Initializes the network.
+
+    Parameters
+    -----------
+    loss : 'top1', 'bpr', 'cross-entropy', 'xe_logit', 'top1-max', 'bpr-max'
+        selects the loss function (default: 'cross-entropy').
+    final_act : 'softmax', 'linear', 'relu', 'tanh', 'softmax_logit'
+        selects the activation function of the final layer (default: 'linear').
+        NOTE: 'leaky-*', 'elu-*', 'selu-*' are not implemented in this Torch version.
+    hidden_act : 'linear', 'relu', 'tanh', 'leaky-<X>', 'elu-<X>', 'selu-<X>-<Y>'
+        kept for API compatibility; currently not used because nn.GRUCell uses tanh internally.
+    layers : list of int values
+        list of the number of GRU units in the layers (default: [100]).
+        NOTE: currently exactly one GRU layer is supported.
+    n_epochs : int
+        number of training epochs (default: 10).
+    batch_size : int
+        size of the minibatch, also affects the number of in-batch negatives (default: 128).
+    dropout_p_hidden : float
+        probability of dropout of hidden units (default: 0.0).
+    dropout_p_embed : float
+        probability of dropout of the input embedding units (default: 0.0).
+    learning_rate : float
+        learning rate (default: 1e-3).
+    momentum : float
+        momentum strength for supported optimizers (default: 0.0).
+    lmbd : float
+        coefficient of L2 regularization (default: 0.0).
+    embedding : int
+        size of the embedding used; 0 means not to use a separate embedding size and to
+        use hidden size instead (default: 0).
+    n_sample : int
+        number of additional negative samples to be used (besides in-batch negatives)
+        (default: 0).
+    sample_alpha : float
+        probability of an item used as an additional negative sample is supp^sample_alpha
+        (e.g. sample_alpha=1 -> popularity based sampling; sample_alpha=0 -> uniform)
+        (default: 0.0).
+    smoothing : float
+        class-label smoothing factor for cross-entropy/xe_logit losses (default: 0.0).
+    constrained_embedding : bool
+        if True, the output weight matrix is also used as input embedding (default: False).
+    adapt : None, 'adagrad', 'rmsprop', 'adam', 'adadelta'
+        sets the learning-rate adaptation strategy (default: 'adam').
+    adapt_params : list
+        kept for API compatibility; currently not used by this Torch implementation.
+    grad_cap : float
+        clip gradients that exceed this value; 0 means no clipping (default: 0.0).
+    bpreg : float
+        score regularization coefficient for BPR-max loss (default: 1.0).
+    sigma : float
+        kept for API compatibility; currently not used by this Torch implementation.
+    init_as_normal : bool
+        kept for API compatibility; currently not used by this Torch implementation.
+    train_random_order : bool
+        whether to randomize the order of sessions in each epoch (default: False).
+    time_sort : bool
+        whether to ensure the order of sessions is chronological when
+        train_random_order=False (default: True).
+    session_key : string
+        header of the session ID column in the input file (default: 'SessionId').
+    item_key : string
+        header of the item ID column in the input file (default: 'ItemId').
+    time_key : string
+        header of the timestamp column in the input file (default: 'Time').
+    device : 'auto' or torch device string
+        training/inference device (default: 'auto').
+    seed : int
+        random seed for NumPy and PyTorch (default: 42).
     """
 
     def __init__(
@@ -312,6 +388,31 @@ class GRU4RecTorch:
         raise NotImplementedError('Unsupported loss for GRU4RecTorch: {}'.format(self.loss))
 
     def fit(self, data, test=None, sample_store=10000000):
+        """
+        Trains the network.
+
+        Parameters
+        --------
+        data : pandas.DataFrame
+            Training data. It contains the transactions of the sessions. It has one
+            column for session IDs, one for item IDs and one for the timestamp of
+            the events (unix timestamps). It must have a header. Column names are
+            arbitrary, but must correspond to the ones set during initialization
+            (session_key, item_key, time_key properties).
+        test : pandas.DataFrame, optional
+            Present for API compatibility. Currently not used during training.
+        sample_store : int
+            If additional negative samples are used (n_sample > 0), GPU utilization
+            can be improved by precomputing a large batch of negative samples and
+            regenerating when necessary. Value is the maximum number of int values
+            (IDs) to be stored in RAM for this cache.
+
+        Notes
+        --------
+        This implementation follows the Theano training structure with session-parallel
+        iteration and sampled candidate sets. Some optimizer internals differ from
+        Theano due to framework differences.
+        """
         if len(data) == 0:
             raise ValueError('Training data is empty.')
 
@@ -513,6 +614,36 @@ class GRU4RecTorch:
         return logits.detach().cpu().numpy()
 
     def predict_next_batch(self, session_ids, input_item_ids, predict_for_item_ids=None, batch=100):
+        """
+        Gives prediction scores for a selected set of items. Can be used in batch
+        mode to predict for multiple independent events (events of different
+        sessions) at once and thus speed up evaluation.
+
+        If the session ID at a given coordinate of the session_ids parameter remains
+        the same during subsequent calls of the function, the corresponding hidden
+        state of the network will be kept intact (this is how one can predict an
+        item sequence in a session). If it changes, the hidden state is reset.
+
+        Parameters
+        --------
+        session_ids : 1D array
+            Contains session IDs of events in the batch. Length must equal batch.
+        input_item_ids : 1D array
+            Contains input item IDs of events in the batch. Length must equal batch.
+            Unknown items are ignored in hidden-state update and receive NaN where
+            appropriate in the output frame.
+        predict_for_item_ids : 1D array (optional)
+            IDs of items for which the network should give prediction scores.
+            Default None means predict over all items in the training set.
+        batch : int
+            Prediction batch size.
+
+        Returns
+        --------
+        out : pandas.DataFrame
+            Prediction scores for selected items for every event of the batch.
+            Columns: events of the batch; rows: items. Rows are indexed by item IDs.
+        """
         session_ids = np.asarray(session_ids)
         input_item_ids = np.asarray(input_item_ids)
         self._ensure_predict_state(batch)
@@ -540,6 +671,30 @@ class GRU4RecTorch:
         raise NotImplementedError('symbolic_predict is not available in GRU4RecTorch.')
 
     def predict_next(self, session_id, input_item_id, predict_for_item_ids=None, skip=False, mode_type='view', timestamp=0):
+        """
+        Gives prediction scores for a selected set of items for a single event.
+
+        Parameters
+        --------
+        session_id : int
+            Session ID of the event.
+        input_item_id : int
+            Input item ID of the event.
+        predict_for_item_ids : 1D array (optional)
+            IDs of items for which the network should give prediction scores.
+            Default None means predict over all items in the training set.
+        skip : bool
+            Present for API compatibility. Currently not used.
+        mode_type : str
+            Present for API compatibility. Currently not used.
+        timestamp : int
+            Present for API compatibility. Currently not used.
+
+        Returns
+        --------
+        out : pandas.Series or None
+            Prediction scores indexed by item ID, or None when input item is unknown.
+        """
         if self.itemidmap is None or input_item_id not in self.itemidmap.index:
             return None
         return self.predict_next_batch(
@@ -558,4 +713,16 @@ class GRU4RecTorch:
         self.predict_batch = None
 
     def support_users(self):
+        """
+        whether it is a session-based or session-aware algorithm
+        (if returns True, method "predict_with_training_data" must be defined as well)
+
+        Parameters
+        --------
+
+        Returns
+        --------
+        True : if it is session-aware
+        False : if it is session-based
+        """
         return False
