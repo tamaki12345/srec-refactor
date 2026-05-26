@@ -43,8 +43,10 @@ class _GRU4RecTorchModel(nn.Module):
         bias = self.output.bias[item_indices]
         return F.linear(hidden, weight, bias)
 
-    def forward_step(self, item_indices, hidden):
+    def forward_step(self, item_indices, hidden, dropout_p_embed=0.0):
         emb = self.embedding(item_indices)
+        if dropout_p_embed > 0.0:
+            emb = F.dropout(emb, p=dropout_p_embed, training=self.training)
         hidden = self.gru_cell(emb, hidden)
         logits = self.output_logits(hidden)
         return hidden, logits
@@ -186,6 +188,15 @@ class GRU4RecTorch:
         data_items = data['ItemIdx'].to_numpy(dtype=np.int64)
         return data_items, offset_sessions, base_order
 
+    def _generate_neg_samples(self, pop, length):
+        if self.sample_alpha:
+            sample = np.searchsorted(pop, np.random.rand(self.n_sample * length))
+        else:
+            sample = np.random.choice(self.n_items, size=self.n_sample * length)
+        if length > 1:
+            sample = sample.reshape((length, self.n_sample))
+        return sample
+
     def _softmax_neg(self, scores, m):
         hm = torch.ones_like(scores)
         hm[:, :m] = hm[:, :m] - torch.eye(m, device=scores.device, dtype=scores.dtype)
@@ -296,6 +307,22 @@ class GRU4RecTorch:
             raise ValueError('No sessions were found in training data.')
         active_batch = min(self.batch_size, n_sessions)
 
+        pop = None
+        sample_pointer = 0
+        generate_length = 0
+        neg_samples = None
+        use_sample_store = False
+        if self.n_sample > 0:
+            pop = data.groupby(self.item_key).size()
+            pop = pop[self.itemidmap.index.values].to_numpy(dtype=np.float64) ** self.sample_alpha
+            pop = pop.cumsum() / pop.sum()
+            pop[-1] = 1.0
+            if sample_store:
+                generate_length = sample_store // self.n_sample
+                if generate_length > 1:
+                    neg_samples = self._generate_neg_samples(pop, generate_length)
+                    use_sample_store = True
+
         for epoch in range(self.n_epochs):
             self.model.train()
             session_idx_arr = np.random.permutation(n_sessions) if self.train_random_order else base_order
@@ -316,12 +343,25 @@ class GRU4RecTorch:
                     out_idx = data_items[start + i + 1]
                     reset = (start + i + 1 == end - 1)
 
+                    if self.n_sample > 0:
+                        if use_sample_store:
+                            if sample_pointer == generate_length:
+                                neg_samples = self._generate_neg_samples(pop, generate_length)
+                                sample_pointer = 0
+                            sample = neg_samples[sample_pointer]
+                            sample_pointer += 1
+                        else:
+                            sample = self._generate_neg_samples(pop, 1)
+                        y = np.hstack([out_idx, sample])
+                    else:
+                        y = out_idx
+
                     xb = torch.as_tensor(in_idx, dtype=torch.long, device=self.device)
-                    yb = torch.as_tensor(out_idx, dtype=torch.long, device=self.device)
+                    yb = torch.as_tensor(y, dtype=torch.long, device=self.device)
 
                     self.optimizer.zero_grad(set_to_none=True)
                     h_active = hidden[:len(iters)]
-                    new_hidden, _ = self.model.forward_step(xb, h_active)
+                    new_hidden, _ = self.model.forward_step(xb, h_active, self.dropout_p_embed)
                     if reset.any():
                         new_hidden = new_hidden.clone()
                         new_hidden[torch.as_tensor(reset, dtype=torch.bool, device=self.device)] = 0.0
@@ -385,7 +425,7 @@ class GRU4RecTorch:
             known_pos = np.where(known_mask)[0]
             known_idx = torch.as_tensor(item_positions.to_numpy()[known_mask], dtype=torch.long, device=self.device)
             known_hidden = self._pred_hidden[known_pos]
-            new_hidden, _ = self.model.forward_step(known_idx, known_hidden)
+            new_hidden, _ = self.model.forward_step(known_idx, known_hidden, 0.0)
             self._pred_hidden[known_pos] = new_hidden
 
         logits = self.model.output_logits(self._pred_hidden)
