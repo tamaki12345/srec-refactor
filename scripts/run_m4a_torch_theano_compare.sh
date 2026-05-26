@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="$ROOT_DIR/results/compare"
 TS="$(date +%Y%m%d_%H%M%S)"
+THEANO_ENV="${THEANO_ENV:-srec_theano_gpu}"
+if [ -x "/usr/local/cuda-12/bin/nvcc" ]; then
+  CUDA_HOME_DEFAULT="/usr/local/cuda-12"
+else
+  CUDA_HOME_DEFAULT="/usr/local/cuda"
+fi
+CUDA_HOME="${CUDA_HOME:-$CUDA_HOME_DEFAULT}"
 mkdir -p "$LOG_DIR"
 
 TORCH_STRICT_LOG="$LOG_DIR/m4a_torch_theano_strict_${TS}.log"
@@ -54,7 +61,7 @@ echo "[INFO] Running Torch optimized experiment (experiment/m4a_torch_optimized.
   run_with_optional_timeout /usr/bin/time -p /home/tamak/srec-refactor/.venv/bin/python run_config.py experiment/m4a_torch_optimized.yml
 ) 2>&1 | tee "$TORCH_OPT_LOG"
 
-echo "[INFO] Running Theano experiment in conda env 'srec' (experiment/m4a_theano.yml)"
+echo "[INFO] Running Theano experiment in conda env '$THEANO_ENV' (experiment/m4a_theano.yml)"
 (
   cd "$ROOT_DIR"
   if ! command -v conda >/dev/null 2>&1; then
@@ -65,11 +72,13 @@ echo "[INFO] Running Theano experiment in conda env 'srec' (experiment/m4a_thean
   # unset; temporarily relax nounset to avoid false-positive aborts.
   set +u
   source "$(conda info --base)/etc/profile.d/conda.sh"
-  conda activate srec
+  conda activate "$THEANO_ENV"
   if [ "${USE_GPU:-0}" = "1" ]; then
-    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-    export THEANO_FLAGS="device=cuda0,floatX=float32,dnn.base_path=$CONDA_PREFIX,dnn.include_path=$CONDA_PREFIX/include,dnn.library_path=$CONDA_PREFIX/lib"
-    echo "[INFO] USE_GPU=1: running Theano with GPU (cuda0)"
+    export CUDA_HOME
+    export PATH="$CUDA_HOME/bin:${PATH}"
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+    export THEANO_FLAGS="device=cuda0,floatX=float32,force_device=True,blas.ldflags=,dnn.enabled=False"
+    echo "[INFO] USE_GPU=1: running Theano with GPU (cuda0), CUDA_HOME=$CUDA_HOME"
   else
     export THEANO_FLAGS="device=cpu,floatX=float32"
     echo "[INFO] USE_GPU is not 1: running Theano with CPU"
