@@ -4,6 +4,7 @@ import pandas as pd
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
 except Exception as exc:
     torch = None
     nn = None
@@ -13,17 +14,29 @@ else:
 
 
 class _GRU4RecTorchModel(nn.Module):
-    def __init__(self, n_items, embedding_dim, hidden_size, dropout_p_hidden=0.0):
+    def __init__(self, n_items, embedding_dim, hidden_size, dropout_p_hidden=0.0, constrained_embedding=False):
         super().__init__()
-        self.embedding = nn.Embedding(n_items, embedding_dim)
+        self.constrained_embedding = bool(constrained_embedding)
+        if self.constrained_embedding:
+            self.embedding = nn.Embedding(n_items, hidden_size)
+            self.output_bias = nn.Parameter(torch.zeros(n_items))
+            self.output = None
+        else:
+            self.embedding = nn.Embedding(n_items, embedding_dim)
+            self.output_bias = None
+            self.output = nn.Linear(hidden_size, n_items)
         self.gru_cell = nn.GRUCell(embedding_dim, hidden_size)
         self.dropout = nn.Dropout(dropout_p_hidden)
-        self.output = nn.Linear(hidden_size, n_items)
+
+    def output_logits(self, hidden):
+        if self.constrained_embedding:
+            return F.linear(self.dropout(hidden), self.embedding.weight, self.output_bias)
+        return self.output(self.dropout(hidden))
 
     def forward_step(self, item_indices, hidden):
         emb = self.embedding(item_indices)
         hidden = self.gru_cell(emb, hidden)
-        logits = self.output(self.dropout(hidden))
+        logits = self.output_logits(hidden)
         return hidden, logits
 
 
@@ -171,17 +184,26 @@ class GRU4RecTorch:
 
         hidden_size = int(self.layers[0])
         embedding_dim = int(self.embedding) if self.embedding > 0 else hidden_size
+        if self.constrained_embedding:
+            embedding_dim = hidden_size
         self.model = _GRU4RecTorchModel(
             n_items=self.n_items,
             embedding_dim=embedding_dim,
             hidden_size=hidden_size,
             dropout_p_hidden=self.dropout_p_hidden,
+            constrained_embedding=self.constrained_embedding,
         ).to(self.device)
 
         self.criterion = nn.CrossEntropyLoss()
         if self.adapt.lower() in ('adam', 'adagrad', 'rmsprop', 'adadelta'):
             if self.adapt.lower() == 'adagrad':
-                self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+                # Disable foreach to avoid large temporary tensors on big item spaces.
+                self.optimizer = torch.optim.Adagrad(
+                    self.model.parameters(),
+                    lr=self.learning_rate,
+                    weight_decay=self.lmbd,
+                    foreach=False,
+                )
             elif self.adapt.lower() == 'rmsprop':
                 self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
             elif self.adapt.lower() == 'adadelta':
@@ -191,8 +213,9 @@ class GRU4RecTorch:
         else:
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
 
-        x_all = torch.as_tensor(x_np, dtype=torch.long, device=self.device)
-        y_all = torch.as_tensor(y_np, dtype=torch.long, device=self.device)
+        # Keep full training pairs on CPU and move only active minibatches to GPU.
+        x_all = torch.as_tensor(x_np, dtype=torch.long)
+        y_all = torch.as_tensor(y_np, dtype=torch.long)
 
         n_samples = x_all.shape[0]
         for epoch in range(self.n_epochs):
@@ -202,13 +225,14 @@ class GRU4RecTorch:
             total_count = 0
             for start in range(0, n_samples, self.batch_size):
                 batch_idx = perm[start:start + self.batch_size]
-                xb = x_all[batch_idx]
-                yb = y_all[batch_idx]
+                batch_idx_t = torch.as_tensor(batch_idx, dtype=torch.long)
+                xb = x_all[batch_idx_t].to(self.device, non_blocking=True)
+                yb = y_all[batch_idx_t].to(self.device, non_blocking=True)
                 h0 = torch.zeros((xb.shape[0], self.layers[0]), dtype=torch.float32, device=self.device)
                 _, logits = self.model.forward_step(xb, h0)
                 loss = self.criterion(logits, yb)
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if self.grad_cap > 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_cap)
@@ -245,7 +269,7 @@ class GRU4RecTorch:
             new_hidden, _ = self.model.forward_step(known_idx, known_hidden)
             self._pred_hidden[known_pos] = new_hidden
 
-        logits = self.model.output(self._pred_hidden)
+        logits = self.model.output_logits(self._pred_hidden)
         return logits.detach().cpu().numpy()
 
     def predict_next_batch(self, session_ids, input_item_ids, predict_for_item_ids=None, batch=100):
