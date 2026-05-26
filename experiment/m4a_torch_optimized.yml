@@ -41,4 +41,6 @@ algorithms:
     use_torch_compile: true
     compile_backend: aot_eager
     compile_mode: reduce-overhead
+    fixed_candidate_size: true
+    use_cuda_graphs: true
   key: gru4rec_torch_optimized

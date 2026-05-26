@@ -150,7 +150,8 @@ class GRU4RecTorch:
                  session_key='SessionId', item_key='ItemId', time_key='Time',
                  device='auto', seed=42, show_progress=True,
                  use_torch_compile=False, compile_mode='reduce-overhead', compile_backend='inductor',
-                 progress_update_interval=128, profile_epoch=False)
+                 progress_update_interval=128, profile_epoch=False,
+                 fixed_candidate_size=False, use_cuda_graphs=False)
     Initializes the network.
 
     Parameters
@@ -234,6 +235,13 @@ class GRU4RecTorch:
         (default: 128).
     profile_epoch : bool
         if True, print per-epoch timing breakdown to identify bottlenecks (default: False).
+    fixed_candidate_size : bool
+        if True, keep the candidate-index tensor length fixed to (batch_size + n_sample)
+        by padding tail steps; this can reduce shape-guard overhead in compile/graph paths
+        (default: False).
+    use_cuda_graphs : bool
+        if True, try to use torch.cuda.make_graphed_callables for full-size steps on CUDA;
+        automatically falls back to eager/compile path if unavailable (default: False).
     """
 
     def __init__(
@@ -273,6 +281,8 @@ class GRU4RecTorch:
         compile_backend='inductor',
         progress_update_interval=128,
         profile_epoch=False,
+        fixed_candidate_size=False,
+        use_cuda_graphs=False,
     ):
         self._ensure_torch_available()
 
@@ -310,6 +320,8 @@ class GRU4RecTorch:
         self.compile_backend = None if compile_backend in (None, '', 'none', 'None') else str(compile_backend)
         self.progress_update_interval = max(1, int(progress_update_interval))
         self.profile_epoch = bool(profile_epoch)
+        self.fixed_candidate_size = bool(fixed_candidate_size)
+        self.use_cuda_graphs = bool(use_cuda_graphs)
 
         if len(self.layers) != 1:
             raise NotImplementedError('GRU4RecTorch currently supports exactly one GRU layer.')
@@ -332,6 +344,7 @@ class GRU4RecTorch:
         self.predict_batch = None
         self._compiled_step = None
         self._compile_enabled = False
+        self._cuda_graph_full_step = None
 
     @staticmethod
     def _ensure_torch_available():
@@ -545,6 +558,32 @@ class GRU4RecTorch:
             print('torch.compile failed ({}). Falling back to eager mode.'.format(exc))
             self._compiled_step = self._step_forward_loss
 
+    def _build_cuda_graphed_full_step(self, full_m, full_y_len, full_scale):
+        self._cuda_graph_full_step = None
+        if not self.use_cuda_graphs:
+            return
+        if not str(self.device).startswith('cuda'):
+            return
+        if not torch.cuda.is_available():
+            return
+        graph_fn = getattr(torch.cuda, 'make_graphed_callables', None)
+        if graph_fn is None:
+            print('torch.cuda.make_graphed_callables is not available. Continuing without CUDA Graphs.')
+            return
+
+        def _full_step(h_active, xb, yb):
+            return self._compiled_step(h_active, xb, yb, full_m, full_scale)
+
+        static_h = torch.zeros((full_m, self.layers[0]), dtype=torch.float32, device=self.device)
+        static_x = torch.zeros(full_m, dtype=torch.long, device=self.device)
+        static_y = torch.zeros(full_y_len, dtype=torch.long, device=self.device)
+        try:
+            self._cuda_graph_full_step = graph_fn(_full_step, (static_h, static_x, static_y))
+            print('Enabled CUDA Graphs for full-size GRU4RecTorch steps (m={}, y={}).'.format(full_m, full_y_len))
+        except Exception as exc:
+            print('CUDA Graph setup failed ({}). Falling back to non-graphed execution.'.format(exc))
+            self._cuda_graph_full_step = None
+
     def fit(self, data, test=None, sample_store=10000000):
         """
         Trains the network.
@@ -654,10 +693,12 @@ class GRU4RecTorch:
             raise ValueError('No sessions were found in training data.')
         total_pairs = int(len(data_items) - n_sessions)
         active_batch = min(self.batch_size, n_sessions)
+        full_y_len = active_batch + max(self.n_sample, 0)
 
         # Reuse device-side buffers to reduce per-step allocation overhead.
         xb_buf = torch.empty(active_batch, dtype=torch.long, device=self.device)
-        yb_buf = torch.empty(active_batch + max(self.n_sample, 0), dtype=torch.long, device=self.device)
+        yb_buf = torch.empty(full_y_len, dtype=torch.long, device=self.device)
+        self._build_cuda_graphed_full_step(active_batch, full_y_len, active_batch / float(self.batch_size))
 
         pop = None
         sample_pointer = 0
@@ -711,6 +752,7 @@ class GRU4RecTorch:
                 out_idx = data_items[start]
                 for i in range(minlen - 1):
                     n_steps += 1
+                    curr_m = len(iters)
                     in_idx = out_idx
                     out_idx = data_items[start + i + 1]
                     reset = (start + i + 1 == end - 1)
@@ -725,15 +767,30 @@ class GRU4RecTorch:
                             sample_pointer += 1
                         else:
                             sample = self._generate_neg_samples(pop, 1)
-                        y = np.hstack([out_idx, sample])
+                        if self.fixed_candidate_size:
+                            y = np.empty(full_y_len, dtype=np.int64)
+                            y[:curr_m] = out_idx
+                            y[curr_m:curr_m + self.n_sample] = sample
+                            if curr_m + self.n_sample < full_y_len:
+                                y[curr_m + self.n_sample:] = out_idx[0]
+                            y_len = full_y_len
+                        else:
+                            y = np.hstack([out_idx, sample])
+                            y_len = curr_m + self.n_sample
                     else:
-                        y = out_idx
+                        if self.fixed_candidate_size:
+                            y = np.empty(full_y_len, dtype=np.int64)
+                            y[:curr_m] = out_idx
+                            if curr_m < full_y_len:
+                                y[curr_m:] = out_idx[0]
+                            y_len = full_y_len
+                        else:
+                            y = out_idx
+                            y_len = curr_m
                     timings['sample_prepare'] += time.perf_counter() - t0
 
                     t0 = time.perf_counter()
-                    curr_m = len(iters)
                     xb_buf[:curr_m].copy_(torch.from_numpy(in_idx), non_blocking=False)
-                    y_len = curr_m + self.n_sample if self.n_sample > 0 else curr_m
                     yb_buf[:y_len].copy_(torch.from_numpy(y), non_blocking=False)
                     xb = xb_buf[:curr_m]
                     yb = yb_buf[:y_len]
@@ -744,16 +801,29 @@ class GRU4RecTorch:
                     h_active = hidden[:len(iters)]
                     step_scale = len(iters) / float(self.batch_size)
                     t0 = time.perf_counter()
-                    try:
-                        new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
-                    except Exception as exc:
-                        if self._compile_enabled:
-                            print('torch.compile runtime failure ({}). Falling back to eager mode.'.format(exc))
-                            self._compiled_step = self._step_forward_loss
-                            self._compile_enabled = False
+                    use_graphed = (
+                        self._cuda_graph_full_step is not None and
+                        curr_m == active_batch and
+                        y_len == full_y_len
+                    )
+                    if use_graphed:
+                        try:
+                            new_hidden, loss = self._cuda_graph_full_step(h_active, xb, yb)
+                        except Exception as exc:
+                            print('CUDA Graph runtime failure ({}). Disabling CUDA Graphs.'.format(exc))
+                            self._cuda_graph_full_step = None
                             new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
-                        else:
-                            raise
+                    else:
+                        try:
+                            new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                        except Exception as exc:
+                            if self._compile_enabled:
+                                print('torch.compile runtime failure ({}). Falling back to eager mode.'.format(exc))
+                                self._compiled_step = self._step_forward_loss
+                                self._compile_enabled = False
+                                new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                            else:
+                                raise
                     timings['forward_loss'] += time.perf_counter() - t0
                     if torch.isnan(loss).item():
                         print(str(epoch) + ': NaN error!')
