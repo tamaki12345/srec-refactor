@@ -489,6 +489,8 @@ class GRU4RecTorch:
     def _loss_fn(self, yhat, m):
         eps = 1e-24
         loss_name = self.loss.lower()
+        # When fixed-size padding is enabled, only the first m rows are real pairs.
+        yhat = yhat[:m]
         diag = torch.diagonal(yhat[:, :m], 0)
 
         if loss_name == 'cross-entropy':
@@ -698,6 +700,7 @@ class GRU4RecTorch:
         # Reuse device-side buffers to reduce per-step allocation overhead.
         xb_buf = torch.empty(active_batch, dtype=torch.long, device=self.device)
         yb_buf = torch.empty(full_y_len, dtype=torch.long, device=self.device)
+        hidden_step_buf = torch.zeros((active_batch, self.layers[0]), dtype=torch.float32, device=self.device)
         use_pinned_transfer = str(self.device).startswith('cuda') and torch.cuda.is_available()
         xb_host = torch.empty(active_batch, dtype=torch.long, pin_memory=use_pinned_transfer)
         yb_host = torch.empty(full_y_len, dtype=torch.long, pin_memory=use_pinned_transfer)
@@ -795,17 +798,30 @@ class GRU4RecTorch:
                     timings['sample_prepare'] += time.perf_counter() - t0
 
                     t0 = time.perf_counter()
-                    xb_host_np[:curr_m] = in_idx
+                    if self.fixed_candidate_size:
+                        xb_host_np[:curr_m] = in_idx
+                        if curr_m < active_batch:
+                            xb_host_np[curr_m:active_batch] = in_idx[0]
+                        x_len = active_batch
+                    else:
+                        xb_host_np[:curr_m] = in_idx
+                        x_len = curr_m
                     yb_host_np[:y_len] = y
-                    xb_buf[:curr_m].copy_(xb_host[:curr_m], non_blocking=use_pinned_transfer)
+                    xb_buf[:x_len].copy_(xb_host[:x_len], non_blocking=use_pinned_transfer)
                     yb_buf[:y_len].copy_(yb_host[:y_len], non_blocking=use_pinned_transfer)
-                    xb = xb_buf[:curr_m]
+                    xb = xb_buf[:x_len]
                     yb = yb_buf[:y_len]
                     timings['transfer'] += time.perf_counter() - t0
 
                     self.model.zero_grad(set_to_none=True)
                     self.optimizer.zero_grad(set_to_none=True)
-                    h_active = hidden[:len(iters)]
+                    h_active = hidden[:curr_m]
+                    if self.fixed_candidate_size and curr_m < active_batch:
+                        hidden_step_buf.zero_()
+                        hidden_step_buf[:curr_m].copy_(h_active)
+                        h_step = hidden_step_buf
+                    else:
+                        h_step = h_active
                     step_scale = len(iters) / float(self.batch_size)
                     t0 = time.perf_counter()
                     use_graphed = (
@@ -815,21 +831,21 @@ class GRU4RecTorch:
                     )
                     if use_graphed:
                         try:
-                            h_graph = h_active.detach().requires_grad_(True)
+                            h_graph = h_step.detach().requires_grad_(True)
                             new_hidden, loss = self._cuda_graph_full_step(h_graph, xb, yb)
                         except Exception as exc:
                             print('CUDA Graph runtime failure ({}). Disabling CUDA Graphs.'.format(exc))
                             self._cuda_graph_full_step = None
-                            new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                            new_hidden, loss = self._compiled_step(h_step, xb, yb, curr_m, step_scale)
                     else:
                         try:
-                            new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                            new_hidden, loss = self._compiled_step(h_step, xb, yb, curr_m, step_scale)
                         except Exception as exc:
                             if self._compile_enabled:
                                 print('torch.compile runtime failure ({}). Falling back to eager mode.'.format(exc))
                                 self._compiled_step = self._step_forward_loss
                                 self._compile_enabled = False
-                                new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                                new_hidden, loss = self._compiled_step(h_step, xb, yb, curr_m, step_scale)
                             else:
                                 raise
                     timings['forward_loss'] += time.perf_counter() - t0
@@ -867,11 +883,11 @@ class GRU4RecTorch:
                     timings['optimizer_step'] += time.perf_counter() - t0
 
                     t0 = time.perf_counter()
-                    next_hidden = new_hidden.detach()
+                    next_hidden = new_hidden[:curr_m].detach()
                     if reset.any():
                         next_hidden = next_hidden.clone()
                         next_hidden[torch.as_tensor(reset, dtype=torch.bool, device=self.device)] = 0.0
-                    hidden[:len(iters)] = next_hidden
+                    hidden[:curr_m] = next_hidden
                     timings['hidden_update'] += time.perf_counter() - t0
 
                     bs = len(iters)
