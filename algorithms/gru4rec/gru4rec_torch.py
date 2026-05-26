@@ -157,19 +157,25 @@ class GRU4RecTorch:
                 value = type(current)(value)
             setattr(self, key, value)
 
-    def _build_training_pairs(self, data):
+    def _init_data(self, data):
         data = data.sort_values([self.session_key, self.time_key]).copy()
         itemids = data[self.item_key].unique()
         self.n_items = len(itemids)
         self.itemidmap = pd.Series(data=np.arange(self.n_items, dtype=np.int64), index=itemids)
-        item_idx = self.itemidmap[data[self.item_key]].to_numpy(dtype=np.int64)
-        sessions = data[self.session_key].to_numpy()
-        starts_new_session = np.ones(len(data), dtype=bool)
-        starts_new_session[1:] = sessions[1:] != sessions[:-1]
-        valid = ~starts_new_session
-        x = item_idx[:-1][valid[1:]]
-        y = item_idx[1:][valid[1:]]
-        return x, y
+        data = pd.merge(
+            data,
+            pd.DataFrame({self.item_key: itemids, 'ItemIdx': self.itemidmap[itemids].values}),
+            on=self.item_key,
+            how='inner',
+        )
+        offset_sessions = np.zeros(data[self.session_key].nunique() + 1, dtype=np.int64)
+        offset_sessions[1:] = data.groupby(self.session_key).size().cumsum().to_numpy(dtype=np.int64)
+        if self.time_sort:
+            base_order = np.argsort(data.groupby(self.session_key)[self.time_key].min().values)
+        else:
+            base_order = np.arange(len(offset_sessions) - 1, dtype=np.int64)
+        data_items = data['ItemIdx'].to_numpy(dtype=np.int64)
+        return data_items, offset_sessions, base_order
 
     def fit(self, data, test=None, sample_store=10000000):
         if len(data) == 0:
@@ -178,8 +184,8 @@ class GRU4RecTorch:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        x_np, y_np = self._build_training_pairs(data)
-        if len(x_np) == 0:
+        data_items, offset_sessions, base_order = self._init_data(data)
+        if len(data_items) < 2:
             raise ValueError('Not enough sequential events to build training pairs.')
 
         hidden_size = int(self.layers[0])
@@ -213,34 +219,73 @@ class GRU4RecTorch:
         else:
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
 
-        # Keep full training pairs on CPU and move only active minibatches to GPU.
-        x_all = torch.as_tensor(x_np, dtype=torch.long)
-        y_all = torch.as_tensor(y_np, dtype=torch.long)
+        n_sessions = len(offset_sessions) - 1
+        if n_sessions == 0:
+            raise ValueError('No sessions were found in training data.')
+        active_batch = min(self.batch_size, n_sessions)
 
-        n_samples = x_all.shape[0]
         for epoch in range(self.n_epochs):
             self.model.train()
-            perm = np.random.permutation(n_samples)
+            session_idx_arr = np.random.permutation(n_sessions) if self.train_random_order else base_order
+            iters = np.arange(active_batch, dtype=np.int64)
+            maxiter = iters.max() if len(iters) else -1
+            start = offset_sessions[session_idx_arr[iters]]
+            end = offset_sessions[session_idx_arr[iters] + 1]
+
+            hidden = torch.zeros((active_batch, self.layers[0]), dtype=torch.float32, device=self.device)
             total_loss = 0.0
             total_count = 0
-            for start in range(0, n_samples, self.batch_size):
-                batch_idx = perm[start:start + self.batch_size]
-                batch_idx_t = torch.as_tensor(batch_idx, dtype=torch.long)
-                xb = x_all[batch_idx_t].to(self.device, non_blocking=True)
-                yb = y_all[batch_idx_t].to(self.device, non_blocking=True)
-                h0 = torch.zeros((xb.shape[0], self.layers[0]), dtype=torch.float32, device=self.device)
-                _, logits = self.model.forward_step(xb, h0)
-                loss = self.criterion(logits, yb)
+            finished = False
+            while not finished:
+                minlen = (end - start).min()
+                out_idx = data_items[start]
+                for i in range(minlen - 1):
+                    in_idx = out_idx
+                    out_idx = data_items[start + i + 1]
+                    reset = (start + i + 1 == end - 1)
 
-                self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if self.grad_cap > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_cap)
-                self.optimizer.step()
+                    xb = torch.as_tensor(in_idx, dtype=torch.long, device=self.device)
+                    yb = torch.as_tensor(out_idx, dtype=torch.long, device=self.device)
 
-                bs = xb.shape[0]
-                total_loss += float(loss.detach().cpu().item()) * bs
-                total_count += bs
+                    self.optimizer.zero_grad(set_to_none=True)
+                    h_active = hidden[:len(iters)]
+                    new_hidden, logits = self.model.forward_step(xb, h_active)
+                    if reset.any():
+                        new_hidden = new_hidden.clone()
+                        new_hidden[torch.as_tensor(reset, dtype=torch.bool, device=self.device)] = 0.0
+                    hidden[:len(iters)] = new_hidden.detach()
+                    loss = self.criterion(logits, yb)
+                    loss.backward()
+                    if self.grad_cap > 0:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_cap)
+                    self.optimizer.step()
+
+                    bs = len(iters)
+                    total_loss += float(loss.detach().cpu().item()) * bs
+                    total_count += bs
+
+                start = start + minlen - 1
+                finished_mask = (end - start <= 1)
+                n_finished = finished_mask.sum()
+                if n_finished > 0:
+                    iters[finished_mask] = maxiter + np.arange(1, n_finished + 1, dtype=np.int64)
+                    maxiter += n_finished
+                valid_mask = (iters < n_sessions)
+                n_valid = valid_mask.sum()
+                if (n_valid == 0) or (n_valid < 2 and self.n_sample == 0):
+                    finished = True
+                    break
+
+                mask = finished_mask & valid_mask
+                if mask.any():
+                    sessions = session_idx_arr[iters[mask]]
+                    start[mask] = offset_sessions[sessions]
+                    end[mask] = offset_sessions[sessions + 1]
+                iters = iters[valid_mask]
+                start = start[valid_mask]
+                end = end[valid_mask]
+                if n_valid < len(valid_mask):
+                    hidden = hidden[torch.as_tensor(valid_mask, dtype=torch.bool, device=self.device)]
 
             print('Epoch{}\tloss: {:.6f}'.format(epoch, total_loss / max(total_count, 1)))
 
