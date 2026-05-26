@@ -19,7 +19,10 @@ else:
     _TORCH_IMPORT_ERROR = None
 
 
-class _GRU4RecTorchModel(nn.Module):
+_NN_MODULE_BASE = nn.Module if nn is not None else object
+
+
+class _GRU4RecTorchModel(_NN_MODULE_BASE):
     def __init__(
         self,
         n_items,
@@ -144,7 +147,8 @@ class GRU4RecTorch:
                  adapt='adagrad', adapt_params=[], grad_cap=0.0, bpreg=1.0,
                  sigma=0.0, init_as_normal=False, train_random_order=False, time_sort=True,
                  session_key='SessionId', item_key='ItemId', time_key='Time',
-                 device='auto', seed=42, show_progress=True)
+                 device='auto', seed=42, show_progress=True,
+                 use_torch_compile=False, compile_mode='reduce-overhead', progress_update_interval=128)
     Initializes the network.
 
     Parameters
@@ -216,6 +220,14 @@ class GRU4RecTorch:
         random seed for NumPy and PyTorch (default: 42).
     show_progress : bool
         if True, display per-epoch tqdm progress with leave=False (default: True).
+    use_torch_compile : bool
+        if True and supported, use torch.compile on the forward/loss core step to reduce
+        Python overhead during training (default: False).
+    compile_mode : str
+        torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune' (default: 'reduce-overhead').
+    progress_update_interval : int
+        number of processed pairs between tqdm updates; larger values reduce progress-bar overhead
+        (default: 128).
     """
 
     def __init__(
@@ -250,6 +262,9 @@ class GRU4RecTorch:
         device='auto',
         seed=42,
         show_progress=True,
+        use_torch_compile=False,
+        compile_mode='reduce-overhead',
+        progress_update_interval=128,
     ):
         self._ensure_torch_available()
 
@@ -282,6 +297,9 @@ class GRU4RecTorch:
         self.time_key = time_key
         self.seed = int(seed)
         self.show_progress = bool(show_progress)
+        self.use_torch_compile = bool(use_torch_compile)
+        self.compile_mode = str(compile_mode)
+        self.progress_update_interval = max(1, int(progress_update_interval))
 
         if len(self.layers) != 1:
             raise NotImplementedError('GRU4RecTorch currently supports exactly one GRU layer.')
@@ -302,6 +320,8 @@ class GRU4RecTorch:
         self.current_session = None
         self._pred_hidden = None
         self.predict_batch = None
+        self._compiled_step = None
+        self._compile_enabled = False
 
     @staticmethod
     def _ensure_torch_available():
@@ -485,6 +505,30 @@ class GRU4RecTorch:
 
         raise NotImplementedError('Unsupported loss for GRU4RecTorch: {}'.format(self.loss))
 
+    def _step_forward_loss(self, h_active, xb, yb, m, scale):
+        new_hidden, _ = self.model.forward_step(xb, h_active, self.dropout_p_embed)
+        scores = self.model.score_items(new_hidden, yb)
+        yhat = self._apply_final_activation(scores)
+        loss = scale * self._loss_fn(yhat, m)
+        return new_hidden, loss
+
+    def _compile_step_if_enabled(self):
+        self._compiled_step = self._step_forward_loss
+        self._compile_enabled = False
+        if not self.use_torch_compile:
+            return
+        compile_fn = getattr(torch, 'compile', None)
+        if compile_fn is None:
+            print('torch.compile is not available in this runtime. Falling back to eager mode.')
+            return
+        try:
+            self._compiled_step = compile_fn(self._step_forward_loss, mode=self.compile_mode)
+            self._compile_enabled = True
+            print('Enabled torch.compile for GRU4RecTorch step (mode={}).'.format(self.compile_mode))
+        except Exception as exc:
+            print('torch.compile failed ({}). Falling back to eager mode.'.format(exc))
+            self._compiled_step = self._step_forward_loss
+
     def fit(self, data, test=None, sample_store=10000000):
         """
         Trains the network.
@@ -537,6 +581,7 @@ class GRU4RecTorch:
             sigma=self.sigma,
             init_as_normal=self.init_as_normal,
         ).to(self.device)
+        self._compile_step_if_enabled()
 
         self._sampled_mode = (self.adapt.lower() == 'adagrad')
         self._sampled_states = {}
@@ -628,6 +673,7 @@ class GRU4RecTorch:
             hidden = torch.zeros((active_batch, self.layers[0]), dtype=torch.float32, device=self.device)
             total_loss = 0.0
             total_count = 0
+            pending_pbar = 0
             finished = False
             while not finished:
                 minlen = (end - start).min()
@@ -656,10 +702,17 @@ class GRU4RecTorch:
                     self.model.zero_grad(set_to_none=True)
                     self.optimizer.zero_grad(set_to_none=True)
                     h_active = hidden[:len(iters)]
-                    new_hidden, _ = self.model.forward_step(xb, h_active, self.dropout_p_embed)
-                    scores = self.model.score_items(new_hidden, yb)
-                    yhat = self._apply_final_activation(scores)
-                    loss = (len(iters) / float(self.batch_size)) * self._loss_fn(yhat, len(iters))
+                    step_scale = len(iters) / float(self.batch_size)
+                    try:
+                        new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                    except Exception as exc:
+                        if self._compile_enabled:
+                            print('torch.compile runtime failure ({}). Falling back to eager mode.'.format(exc))
+                            self._compiled_step = self._step_forward_loss
+                            self._compile_enabled = False
+                            new_hidden, loss = self._compiled_step(h_active, xb, yb, len(iters), step_scale)
+                        else:
+                            raise
                     if torch.isnan(loss).item():
                         print(str(epoch) + ': NaN error!')
                         self.error_during_train = True
@@ -697,7 +750,10 @@ class GRU4RecTorch:
                     total_loss += float(loss.detach().cpu().item()) * bs
                     total_count += bs
                     if pbar is not None:
-                        pbar.update(bs)
+                        pending_pbar += bs
+                        if pending_pbar >= self.progress_update_interval:
+                            pbar.update(pending_pbar)
+                            pending_pbar = 0
 
                 start = start + minlen - 1
                 finished_mask = (end - start <= 1)
@@ -723,6 +779,8 @@ class GRU4RecTorch:
                     hidden = hidden[torch.as_tensor(valid_mask, dtype=torch.bool, device=self.device)]
 
             if pbar is not None:
+                if pending_pbar > 0:
+                    pbar.update(pending_pbar)
                 if total_count < total_pairs:
                     pbar.update(total_pairs - total_count)
                 pbar.close()
