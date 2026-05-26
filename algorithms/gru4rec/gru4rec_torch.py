@@ -698,6 +698,11 @@ class GRU4RecTorch:
         # Reuse device-side buffers to reduce per-step allocation overhead.
         xb_buf = torch.empty(active_batch, dtype=torch.long, device=self.device)
         yb_buf = torch.empty(full_y_len, dtype=torch.long, device=self.device)
+        use_pinned_transfer = str(self.device).startswith('cuda') and torch.cuda.is_available()
+        xb_host = torch.empty(active_batch, dtype=torch.long, pin_memory=use_pinned_transfer)
+        yb_host = torch.empty(full_y_len, dtype=torch.long, pin_memory=use_pinned_transfer)
+        xb_host_np = xb_host.numpy()
+        yb_host_np = yb_host.numpy()
         self._build_cuda_graphed_full_step(active_batch, full_y_len, active_batch / float(self.batch_size))
 
         pop = None
@@ -790,8 +795,10 @@ class GRU4RecTorch:
                     timings['sample_prepare'] += time.perf_counter() - t0
 
                     t0 = time.perf_counter()
-                    xb_buf[:curr_m].copy_(torch.from_numpy(in_idx), non_blocking=False)
-                    yb_buf[:y_len].copy_(torch.from_numpy(y), non_blocking=False)
+                    xb_host_np[:curr_m] = in_idx
+                    yb_host_np[:y_len] = y
+                    xb_buf[:curr_m].copy_(xb_host[:curr_m], non_blocking=use_pinned_transfer)
+                    yb_buf[:y_len].copy_(yb_host[:y_len], non_blocking=use_pinned_transfer)
                     xb = xb_buf[:curr_m]
                     yb = yb_buf[:y_len]
                     timings['transfer'] += time.perf_counter() - t0
