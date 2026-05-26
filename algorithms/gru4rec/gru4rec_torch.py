@@ -14,8 +14,23 @@ else:
 
 
 class _GRU4RecTorchModel(nn.Module):
-    def __init__(self, n_items, embedding_dim, hidden_size, dropout_p_hidden=0.0, constrained_embedding=False):
+    def __init__(
+        self,
+        n_items,
+        embedding_dim,
+        hidden_size,
+        dropout_p_hidden=0.0,
+        constrained_embedding=False,
+        hidden_act='tanh',
+        sigma=0.0,
+        init_as_normal=False,
+    ):
         super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.embedding_dim = int(embedding_dim)
+        self.hidden_act = hidden_act
+        self.sigma = float(sigma)
+        self.init_as_normal = bool(init_as_normal)
         self.constrained_embedding = bool(constrained_embedding)
         if self.constrained_embedding:
             self.embedding = nn.Embedding(n_items, hidden_size)
@@ -24,14 +39,68 @@ class _GRU4RecTorchModel(nn.Module):
         else:
             self.embedding = nn.Embedding(n_items, embedding_dim)
             self.output_bias = None
-            self.output = nn.Linear(hidden_size, n_items)
-        self.gru_cell = nn.GRUCell(embedding_dim, hidden_size)
+            self.output_weight = nn.Parameter(torch.empty(n_items, hidden_size))
+            self.output_bias = nn.Parameter(torch.zeros(n_items))
+            self.output = None
+        self.Wx = nn.Parameter(torch.empty(embedding_dim, hidden_size * 3))
+        self.Wh = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.Wrz = nn.Parameter(torch.empty(hidden_size, hidden_size * 2))
+        self.Bh = nn.Parameter(torch.zeros(hidden_size * 3))
         self.dropout = nn.Dropout(dropout_p_hidden)
+        self.reset_parameters()
+
+    def _init_param(self, param):
+        if param.ndim < 2:
+            param.data.zero_()
+            return
+        if self.sigma != 0.0:
+            scale = self.sigma
+        else:
+            scale = np.sqrt(6.0 / float(param.shape[0] + param.shape[1]))
+        if self.init_as_normal:
+            nn.init.normal_(param, mean=0.0, std=scale)
+        else:
+            nn.init.uniform_(param, a=-scale, b=scale)
+
+    def reset_parameters(self):
+        self._init_param(self.embedding.weight)
+        self._init_param(self.Wx)
+        self._init_param(self.Wh)
+        self._init_param(self.Wrz)
+        self.Bh.data.zero_()
+        if self.constrained_embedding:
+            self.output_bias.data.zero_()
+        else:
+            self._init_param(self.output_weight)
+            self.output_bias.data.zero_()
+
+    def _apply_hidden_activation(self, x):
+        hidden_act = self.hidden_act.lower()
+        if hidden_act == 'relu':
+            return torch.relu(x)
+        if hidden_act == 'tanh':
+            return torch.tanh(x)
+        if hidden_act == 'linear':
+            return x
+        if hidden_act.startswith('leaky-'):
+            leak = float(hidden_act.split('-')[1])
+            return F.leaky_relu(x, negative_slope=leak)
+        if hidden_act.startswith('elu-'):
+            alpha = float(hidden_act.split('-')[1])
+            return F.elu(x, alpha=alpha)
+        if hidden_act.startswith('selu-'):
+            parts = hidden_act.split('-')[1:]
+            if len(parts) != 2:
+                raise ValueError('Invalid selu hidden_act: {}'.format(self.hidden_act))
+            lmbd = float(parts[0])
+            alpha = float(parts[1])
+            return lmbd * torch.where(x >= 0, x, alpha * (torch.exp(x) - 1.0))
+        raise NotImplementedError('Unsupported hidden_act for GRU4RecTorch: {}'.format(self.hidden_act))
 
     def output_logits(self, hidden):
         if self.constrained_embedding:
             return F.linear(self.dropout(hidden), self.embedding.weight, self.output_bias)
-        return self.output(self.dropout(hidden))
+        return F.linear(self.dropout(hidden), self.output_weight, self.output_bias)
 
     def score_items(self, hidden, item_indices):
         hidden = self.dropout(hidden)
@@ -39,17 +108,22 @@ class _GRU4RecTorchModel(nn.Module):
             weight = self.embedding.weight[item_indices]
             bias = self.output_bias[item_indices]
             return F.linear(hidden, weight, bias)
-        weight = self.output.weight[item_indices]
-        bias = self.output.bias[item_indices]
+        weight = self.output_weight[item_indices]
+        bias = self.output_bias[item_indices]
         return F.linear(hidden, weight, bias)
 
     def forward_step(self, item_indices, hidden, dropout_p_embed=0.0):
         emb = self.embedding(item_indices)
         if dropout_p_embed > 0.0:
             emb = F.dropout(emb, p=dropout_p_embed, training=self.training)
-        hidden = self.gru_cell(emb, hidden)
-        logits = self.output_logits(hidden)
-        return hidden, logits
+        hs = self.hidden_size
+        vec = torch.matmul(emb, self.Wx) + self.Bh
+        rz = torch.sigmoid(vec[:, hs:] + torch.matmul(hidden, self.Wrz))
+        h_tilde = self._apply_hidden_activation(torch.matmul(hidden * rz[:, :hs], self.Wh) + vec[:, :hs])
+        z = rz[:, hs:]
+        hidden_new = (1.0 - z) * hidden + z * h_tilde
+        logits = self.output_logits(hidden_new)
+        return hidden_new, logits
 
 
 class GRU4RecTorch:
@@ -214,6 +288,7 @@ class GRU4RecTorch:
         self.itemidmap = None
         self.n_items = 0
         self.predict = None
+        self.error_during_train = False
         self.current_session = None
         self._pred_hidden = None
         self.predict_batch = None
@@ -343,6 +418,19 @@ class GRU4RecTorch:
             return torch.softmax(scores, dim=1)
         if final_act == 'softmax_logit':
             return torch.logsumexp(scores, dim=1, keepdim=True) - scores
+        if final_act.startswith('leaky-'):
+            leak = float(final_act.split('-')[1])
+            return F.leaky_relu(scores, negative_slope=leak)
+        if final_act.startswith('elu-'):
+            alpha = float(final_act.split('-')[1])
+            return F.elu(scores, alpha=alpha)
+        if final_act.startswith('selu-'):
+            parts = final_act.split('-')[1:]
+            if len(parts) != 2:
+                raise ValueError('Invalid selu final_act: {}'.format(self.final_act))
+            lmbd = float(parts[0])
+            alpha = float(parts[1])
+            return lmbd * torch.where(scores >= 0, scores, alpha * (torch.exp(scores) - 1.0))
         raise NotImplementedError('Unsupported final_act for GRU4RecTorch: {}'.format(self.final_act))
 
     def _loss_fn(self, yhat, m):
@@ -413,6 +501,8 @@ class GRU4RecTorch:
         iteration and sampled candidate sets. Some optimizer internals differ from
         Theano due to framework differences.
         """
+        self.predict = None
+        self.error_during_train = False
         if len(data) == 0:
             raise ValueError('Training data is empty.')
 
@@ -433,17 +523,20 @@ class GRU4RecTorch:
             hidden_size=hidden_size,
             dropout_p_hidden=self.dropout_p_hidden,
             constrained_embedding=self.constrained_embedding,
+            hidden_act=self.hidden_act,
+            sigma=self.sigma,
+            init_as_normal=self.init_as_normal,
         ).to(self.device)
 
         self._sampled_mode = (self.adapt.lower() == 'adagrad')
         self._sampled_states = {}
 
         if self._sampled_mode:
-            dense_params = list(self.model.gru_cell.parameters())
+            dense_params = [self.model.Wx, self.model.Wh, self.model.Wrz, self.model.Bh]
             if self.constrained_embedding:
                 sampled_params = [self.model.embedding.weight, self.model.output_bias]
             else:
-                sampled_params = [self.model.embedding.weight, self.model.output.weight, self.model.output.bias]
+                sampled_params = [self.model.embedding.weight, self.model.output_weight, self.model.output_bias]
             for param in sampled_params:
                 self._sampled_states[param] = self._init_sampled_state(param, use_momentum=(self.momentum > 0))
             self.optimizer = torch.optim.Adagrad(
@@ -455,13 +548,33 @@ class GRU4RecTorch:
         else:
             if self.adapt.lower() in ('adam', 'adagrad', 'rmsprop', 'adadelta'):
                 if self.adapt.lower() == 'rmsprop':
-                    self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
+                    alpha = float(self.adapt_params[0]) if len(self.adapt_params) >= 1 else 0.9
+                    self.optimizer = torch.optim.RMSprop(
+                        self.model.parameters(),
+                        lr=self.learning_rate,
+                        alpha=alpha,
+                        momentum=self.momentum,
+                        weight_decay=self.lmbd,
+                    )
                 elif self.adapt.lower() == 'adadelta':
-                    self.optimizer = torch.optim.Adadelta(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+                    rho = float(self.adapt_params[0]) if len(self.adapt_params) >= 1 else 0.95
+                    self.optimizer = torch.optim.Adadelta(
+                        self.model.parameters(),
+                        lr=self.learning_rate,
+                        rho=rho,
+                        weight_decay=self.lmbd,
+                    )
                 elif self.adapt.lower() == 'adagrad':
                     self.optimizer = torch.optim.Adagrad(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd, foreach=False)
                 else:
-                    self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.lmbd)
+                    b1 = float(self.adapt_params[0]) if len(self.adapt_params) >= 1 else 0.9
+                    b2 = float(self.adapt_params[1]) if len(self.adapt_params) >= 2 else 0.999
+                    self.optimizer = torch.optim.Adam(
+                        self.model.parameters(),
+                        lr=self.learning_rate,
+                        betas=(b1, b2),
+                        weight_decay=self.lmbd,
+                    )
             else:
                 self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum, weight_decay=self.lmbd)
 
@@ -485,6 +598,10 @@ class GRU4RecTorch:
                 if generate_length > 1:
                     neg_samples = self._generate_neg_samples(pop, generate_length)
                     use_sample_store = True
+                else:
+                    print('No example store was used')
+            else:
+                print('No example store was used')
 
         for epoch in range(self.n_epochs):
             self.model.train()
@@ -529,6 +646,10 @@ class GRU4RecTorch:
                     scores = self.model.score_items(new_hidden, yb)
                     yhat = self._apply_final_activation(scores)
                     loss = (len(iters) / float(self.batch_size)) * self._loss_fn(yhat, len(iters))
+                    if torch.isnan(loss).item():
+                        print(str(epoch) + ': NaN error!')
+                        self.error_during_train = True
+                        return
                     loss.backward()
                     if self.grad_cap > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_cap)
@@ -542,11 +663,11 @@ class GRU4RecTorch:
                             self.model.output_bias.grad = None
                         else:
                             self._rowwise_adagrad_step(self.model.embedding.weight, xb)
-                            self._rowwise_adagrad_step(self.model.output.weight, yb)
-                            self._rowwise_adagrad_step(self.model.output.bias, yb)
+                            self._rowwise_adagrad_step(self.model.output_weight, yb)
+                            self._rowwise_adagrad_step(self.model.output_bias, yb)
                             self.model.embedding.weight.grad = None
-                            self.model.output.weight.grad = None
-                            self.model.output.bias.grad = None
+                            self.model.output_weight.grad = None
+                            self.model.output_bias.grad = None
 
                     self.optimizer.step()
 
@@ -644,6 +765,8 @@ class GRU4RecTorch:
             Prediction scores for selected items for every event of the batch.
             Columns: events of the batch; rows: items. Rows are indexed by item IDs.
         """
+        if self.error_during_train:
+            raise Exception
         session_ids = np.asarray(session_ids)
         input_item_ids = np.asarray(input_item_ids)
         self._ensure_predict_state(batch)
@@ -708,6 +831,7 @@ class GRU4RecTorch:
         self.model = None
         self.optimizer = None
         self.predict = None
+        self.error_during_train = False
         self.current_session = None
         self._pred_hidden = None
         self.predict_batch = None
