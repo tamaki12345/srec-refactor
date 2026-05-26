@@ -1,7 +1,13 @@
 import time
 import numpy as np
 import pandas as pd
+import importlib
 from collections import OrderedDict
+
+try:
+    tqdm = importlib.import_module('tqdm.auto').tqdm
+except Exception:
+    tqdm = None
 
 _THEANO_IMPORT_ERROR = None
 try:
@@ -35,7 +41,8 @@ class GRU4Rec:
                  n_epochs=10, batch_size=32, dropout_p_hidden=0.0, dropout_p_embed=0.0, learning_rate=0.1, momentum=0.0, lmbd=0.0, embedding=0, n_sample=2048, sample_alpha=0.75, smoothing=0.0, constrained_embedding=False,
                  adapt='adagrad', adapt_params=[], grad_cap=0.0, bpreg=1.0,
                  sigma=0.0, init_as_normal=False, train_random_order=False, time_sort=True,
-                 session_key='SessionId', item_key='ItemId', time_key='Time')
+                 session_key='SessionId', item_key='ItemId', time_key='Time',
+                 show_progress=False, progress_update_interval=128)
     Initializes the network.
 
     Parameters
@@ -95,13 +102,18 @@ class GRU4Rec:
         header of the item ID column in the input file (default: 'ItemId')
     time_key : string
         header of the timestamp column in the input file (default: 'Time')
+    show_progress : bool
+        if True, display per-epoch tqdm progress with leave=False (default: False)
+    progress_update_interval : int
+        number of processed pairs between tqdm updates; larger values reduce progress-bar overhead (default: 128)
 
     '''
     def __init__(self, loss='bpr-max', final_act='linear', hidden_act='tanh', layers=None,
                  n_epochs=10, batch_size=32, dropout_p_hidden=0.0, dropout_p_embed=0.0, learning_rate=0.1, momentum=0.0, lmbd=0.0, embedding=0, n_sample=2048, sample_alpha=0.75, smoothing=0.0, constrained_embedding=False,
                  adapt='adagrad', adapt_params=None, grad_cap=0.0, bpreg=1.0,
                  sigma=0.0, init_as_normal=False, train_random_order=False, time_sort=True,
-                 session_key='SessionId', item_key='ItemId', time_key='Time'):
+                 session_key='SessionId', item_key='ItemId', time_key='Time',
+                 show_progress=False, progress_update_interval=128):
         self._ensure_theano_available()
         self.layers = [100] if layers is None else layers
         self.n_epochs = n_epochs
@@ -123,6 +135,8 @@ class GRU4Rec:
         self.embedding = embedding
         self.constrained_embedding = constrained_embedding
         self.time_sort = time_sort
+        self.show_progress = show_progress
+        self.progress_update_interval = max(1, int(progress_update_interval))
         self.adapt = adapt
         self.loss = loss
         self.set_loss_function(self.loss)
@@ -559,9 +573,15 @@ class GRU4Rec:
         train_function = function(inputs=[X, Y, M, R], outputs=cost, updates=updates, allow_input_downcast=True)
         base_order = np.argsort(data.groupby(self.session_key)[self.time_key].min().values) if self.time_sort else np.arange(len(offset_sessions)-1)
         data_items = data.ItemIdx.values
+        n_sessions = len(offset_sessions) - 1
+        total_pairs = int(len(data_items) - n_sessions)
         for epoch in range(self.n_epochs):
             sc = time.perf_counter();
             st = time.time();
+            pbar = None
+            if self.show_progress and tqdm is not None and total_pairs > 0:
+                pbar = tqdm(total=total_pairs, desc='Epoch{}'.format(epoch), leave=False, unit='pair')
+            pending_pbar = 0
             for i in range(len(self.layers)):
                 self.H[i].set_value(np.zeros((self.batch_size,self.layers[i]), dtype=theano.config.floatX), borrow=True)
             c = []
@@ -590,18 +610,20 @@ class GRU4Rec:
                         y = np.hstack([out_idx, sample])
                     else:
                         y = out_idx
-                        if self.n_sample:
-                            if sample_pointer == generate_length:
-                                generate_samples()
-                                sample_pointer = 0
-                            sample_pointer += 1
                     reset = (start+i+1 == end-1)
                     cost = train_function(in_idx, y, len(iters), reset)
                     c.append(cost)
                     cc.append(len(iters))
+                    if pbar is not None:
+                        pending_pbar += len(iters)
+                        if pending_pbar >= self.progress_update_interval:
+                            pbar.update(pending_pbar)
+                            pending_pbar = 0
                     if np.isnan(cost):
                         print(str(epoch) + ': NaN error!')
                         self.error_during_train = True
+                        if pbar is not None:
+                            pbar.close()
                         return
                 start = start+minlen-1
                 finished_mask = (end-start<=1)
@@ -625,6 +647,12 @@ class GRU4Rec:
                         tmp = self.H[i].get_value(borrow=True)
                         tmp = tmp[valid_mask]
                         self.H[i].set_value(tmp, borrow=True)
+            if pbar is not None:
+                if pending_pbar > 0:
+                    pbar.update(pending_pbar)
+                if np.sum(cc) < total_pairs:
+                    pbar.update(total_pairs - int(np.sum(cc)))
+                pbar.close()
             c = np.array(c)
             cc = np.array(cc)
             avgc = np.sum(c * cc) / np.sum(cc)
